@@ -2543,3 +2543,22 @@ test("threads lists registered threads and forget removes one", () => {
   assert.equal(missing.status, 1);
   assert.match(missing.stderr, /No thread named "rev"/);
 });
+
+test("the stop-time review gate never registers a thread", () => {
+  const { repo, env } = seedDirtyRepo();
+  const enable = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(enable.status, 0, enable.stderr);
+
+  const hook = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({
+      cwd: repo,
+      session_id: "sess-gate",
+      last_assistant_message: "I changed src/app.js to bump the value."
+    })
+  });
+  assert.equal(hook.status, 0, hook.stderr);
+  assert.equal(JSON.parse(hook.stdout).decision, "block");
+  assert.equal(fs.existsSync(path.join(resolveStateDir(repo), "threads.json")), false);
+});
