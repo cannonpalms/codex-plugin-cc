@@ -2466,3 +2466,80 @@ test("review --name rejects a duplicate name before contacting Codex", () => {
   assert.equal(again.status, 1);
   assert.match(again.stderr, /A thread named "dup" already exists/);
 });
+
+test("ask resumes a named thread and is read-only by default", () => {
+  const { repo, env, statePath } = seedDirtyRepo();
+  run("node", [SCRIPT, "review", "--name", "rev"], { cwd: repo, env });
+  const result = run("node", [SCRIPT, "ask", "rev", "elaborate on the follow up"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Resumed the prior run\./);
+  assert.match(result.stdout, /Thread: rev \(thr_1\)/);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
+  assert.equal(fakeState.lastTurnStart.prompt, "elaborate on the follow up");
+  assert.equal(fakeState.lastResume.sandbox, "read-only");
+});
+
+test("ask requires a thread and a prompt", () => {
+  const { repo, env } = seedRepo();
+  const noThread = run("node", [SCRIPT, "ask"], { cwd: repo, env });
+  assert.equal(noThread.status, 1);
+  assert.match(noThread.stderr, /Usage: ask <thread> <prompt>/);
+
+  run("node", [SCRIPT, "task", "--name", "t", "x"], { cwd: repo, env });
+  const noPrompt = run("node", [SCRIPT, "ask", "t"], { cwd: repo, env });
+  assert.equal(noPrompt.status, 1);
+  assert.match(noPrompt.stderr, /Provide a question for thread "t"/);
+});
+
+test("ask on an unknown thread fails before anything is queued", () => {
+  const { repo, env } = seedRepo();
+  const result = run("node", [SCRIPT, "ask", "ghost", "--background", "hi"], { cwd: repo, env });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /No thread named "ghost"/);
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
+  assert.deepEqual(JSON.parse(status.stdout).running, []);
+});
+
+test("ask --background queues a job that carries the thread name", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  run("node", [SCRIPT, "task", "--name", "bg", "start"], { cwd: repo, env });
+  const launched = run("node", [SCRIPT, "ask", "bg", "--background", "--json", "follow up"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+  const waited = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "15000", "--json"], { cwd: repo, env });
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+  assert.equal(JSON.parse(waited.stdout).job.threadName, "bg");
+  assert.equal(JSON.parse(waited.stdout).job.title, "Codex Ask bg");
+});
+
+test("threads lists registered threads and forget removes one", () => {
+  const { repo, env } = seedDirtyRepo();
+  const empty = run("node", [SCRIPT, "threads"], { cwd: repo, env });
+  assert.equal(empty.status, 0, empty.stderr);
+  assert.match(empty.stdout, /No Codex threads in this repository\./);
+
+  run("node", [SCRIPT, "review", "--name", "rev"], { cwd: repo, env });
+  run("node", [SCRIPT, "task", "--name", "fix", "--write", "fix it"], { cwd: repo, env });
+
+  const listed = run("node", [SCRIPT, "threads"], { cwd: repo, env });
+  assert.equal(listed.status, 0, listed.stderr);
+  assert.match(listed.stdout, /\| fix \| task \| idle \| 1 \| just now \| fix it \|/);
+  assert.match(listed.stdout, /\| rev \| review \| idle \| 1 \| just now \| Review working tree diff \|/);
+
+  const asJson = run("node", [SCRIPT, "threads", "--json"], { cwd: repo, env });
+  assert.deepEqual(JSON.parse(asJson.stdout).threads.map((t) => t.name), ["fix", "rev"]);
+
+  const forgotten = run("node", [SCRIPT, "forget", "rev"], { cwd: repo, env });
+  assert.equal(forgotten.status, 0, forgotten.stderr);
+  assert.match(forgotten.stdout, /Forgot thread rev\.\nThe Codex conversation itself is untouched\.\nResume in Codex: codex resume thr_1/);
+  assert.deepEqual(readRegistry(repo).threads.map((t) => t.name), ["fix"]);
+
+  const missing = run("node", [SCRIPT, "forget", "rev"], { cwd: repo, env });
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /No thread named "rev"/);
+});

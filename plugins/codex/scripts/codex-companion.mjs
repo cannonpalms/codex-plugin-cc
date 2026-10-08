@@ -53,6 +53,7 @@ import {
 import {
   acquireThread,
   findLatestThread,
+  forgetThread,
   listThreads,
   releaseThread,
   reserveThread,
@@ -63,6 +64,7 @@ import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
   appendThreadBlock,
   formatRelativeTime,
+  renderThreadsReport,
   renderNativeReviewResult,
   renderReviewResult,
   renderStoredJobResult,
@@ -89,9 +91,12 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs review [--wait|--background] [--name <thread>] [--base <ref>] [--scope <auto|working-tree|branch>]",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--name <thread>] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--name <thread>|--thread <ref>|--resume-last|--resume|--fresh] [--ephemeral] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs ask <thread> [--background|--wait] [--write] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs threads [--json]",
+      "  node scripts/codex-companion.mjs forget <thread> [--json]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -1141,6 +1146,74 @@ function handleTaskResumeCandidate(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
+async function handleAsk(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    booleanOptions: ["json", "write", "background", "wait"],
+    aliasMap: {
+      m: "model"
+    }
+  });
+
+  const [threadRef, ...promptParts] = positionals;
+  if (!threadRef) {
+    throw new Error("Usage: ask <thread> <prompt>. Run /cx:threads to list known threads.");
+  }
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const entry = resolveThread(workspaceRoot, threadRef);
+  const prompt = readTaskPrompt(cwd, options, promptParts);
+  if (!prompt) {
+    throw new Error(`Provide a question for thread "${entry.name}".`);
+  }
+  if (entry.kind === "review" && !NATIVE_REVIEW_FOLLOW_UP) {
+    process.stderr.write(
+      "Note: built-in reviews cannot see their own findings on follow-up. For a reviewer you can question, use /cx:adversarial-review --name <name>.\n"
+    );
+  }
+
+  await launchTask({
+    cwd,
+    workspaceRoot,
+    options,
+    prompt,
+    resumeLast: false,
+    threadName: null,
+    threadRef: entry.name,
+    ephemeral: false,
+    title: `Codex Ask ${entry.name}`,
+    summary: shorten(prompt)
+  });
+}
+
+function handleThreads(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const threads = listThreads(workspaceRoot);
+  outputCommandResult({ workspaceRoot, threads }, renderThreadsReport(threads), options.json);
+}
+
+function handleForget(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+  const name = positionals[0];
+  if (!name) {
+    throw new Error("Usage: forget <thread>. Run /cx:threads to list known threads.");
+  }
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const entry = forgetThread(workspaceRoot, name);
+  const lines = [`Forgot thread ${entry.name}.`, "The Codex conversation itself is untouched."];
+  if (entry.threadId) {
+    lines.push(`Resume in Codex: codex resume ${entry.threadId}`);
+  }
+  outputCommandResult({ forgotten: entry }, `${lines.join("\n")}\n`, options.json);
+}
+
 async function handleCancel(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
@@ -1242,6 +1315,15 @@ async function main() {
       break;
     case "cancel":
       await handleCancel(argv);
+      break;
+    case "ask":
+      await handleAsk(argv);
+      break;
+    case "threads":
+      handleThreads(argv);
+      break;
+    case "forget":
+      handleForget(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);
