@@ -109,6 +109,10 @@ function buildTaskThreadName(prompt) {
   return excerpt ? `${TASK_THREAD_PREFIX}: ${excerpt}` : TASK_THREAD_PREFIX;
 }
 
+export function buildRegisteredThreadName(name) {
+  return `cx:${name}`;
+}
+
 function extractThreadId(message) {
   return message?.params?.threadId ?? null;
 }
@@ -1010,8 +1014,8 @@ export async function runAppServerReview(cwd, options = {}) {
     const thread = await startThread(client, cwd, {
       model: options.model,
       sandbox: "read-only",
-      ephemeral: true,
-      threadName: options.threadName
+      ephemeral: !options.persistThread,
+      threadName: options.threadName ?? null
     });
     const sourceThreadId = thread.thread.id;
     emitProgress(options.onProgress, `Thread ready (${sourceThreadId}).`, "starting", {

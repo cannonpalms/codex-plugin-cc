@@ -2257,3 +2257,30 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
 });
+
+test("runAppServerReview persists and names the thread when asked", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "a.txt"), "x\n");
+
+  const { runAppServerReview, buildRegisteredThreadName } = await import("../plugins/codex/scripts/lib/codex.mjs");
+  const previousPath = process.env.PATH;
+  process.env.PATH = buildEnv(binDir).PATH;
+  try {
+    const result = await runAppServerReview(repo, {
+      target: { type: "uncommittedChanges" },
+      persistThread: true,
+      threadName: buildRegisteredThreadName("review-9")
+    });
+    assert.equal(result.status, 0);
+    const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    const thread = fakeState.threads.find((t) => t.id === result.sourceThreadId);
+    assert.equal(thread.ephemeral, false);
+    assert.equal(thread.name, "cx:review-9");
+  } finally {
+    process.env.PATH = previousPath;
+  }
+});
