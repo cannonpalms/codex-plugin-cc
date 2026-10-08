@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import {
-    buildPersistentTaskThreadName,
+    buildRegisteredThreadName,
     DEFAULT_CONTINUE_PROMPT,
     findLatestTaskThread,
     getCodexAuthStatus,
@@ -29,7 +29,6 @@ import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
   getConfig,
-  listJobs,
   setConfig,
   upsertJob,
   writeJobFile
@@ -39,8 +38,7 @@ import {
   buildStatusSnapshot,
   readStoredJob,
   resolveCancelableJob,
-  resolveResultJob,
-  sortJobsNewestFirst
+  resolveResultJob
 } from "./lib/job-control.mjs";
 import {
   appendLogLine,
@@ -52,8 +50,19 @@ import {
   runTrackedJob,
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
+import {
+  acquireThread,
+  findLatestThread,
+  listThreads,
+  releaseThread,
+  reserveThread,
+  resolveThread,
+  validateThreadName
+} from "./lib/threads.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
+  appendThreadBlock,
+  formatRelativeTime,
   renderNativeReviewResult,
   renderReviewResult,
   renderStoredJobResult,
@@ -295,26 +304,6 @@ function getCurrentClaudeSessionId() {
   return process.env[SESSION_ID_ENV] ?? null;
 }
 
-function filterJobsForCurrentClaudeSession(jobs) {
-  const sessionId = getCurrentClaudeSessionId();
-  if (!sessionId) {
-    return jobs;
-  }
-  return jobs.filter((job) => job.sessionId === sessionId);
-}
-
-function findLatestResumableTaskJob(jobs) {
-  return (
-    jobs.find(
-      (job) =>
-        job.jobClass === "task" &&
-        job.threadId &&
-        job.status !== "queued" &&
-        job.status !== "running"
-    ) ?? null
-  );
-}
-
 async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
@@ -333,26 +322,79 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   };
 }
 
-async function resolveLatestTrackedTaskThread(cwd, options = {}) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const sessionId = getCurrentClaudeSessionId();
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
-  const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
-  const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
-  if (activeTask) {
-    throw new Error(`Task ${activeTask.id} is still running. Use /cx:status before continuing it.`);
-  }
+function threadSummary(entry) {
+  return entry ? { name: entry.name, threadId: entry.threadId ?? null } : null;
+}
 
-  const trackedTask = findLatestResumableTaskJob(visibleJobs);
-  if (trackedTask) {
-    return { id: trackedTask.threadId };
-  }
+// A run can fail after Codex has created the thread. The first thread id a run
+// reports is its own, so remembering it lets the registry keep that thread.
+function trackStartedThread(onProgress) {
+  const tracker = {
+    threadId: null,
+    onProgress(event) {
+      if (!tracker.threadId && event && typeof event === "object" && event.threadId) {
+        tracker.threadId = event.threadId;
+      }
+      onProgress?.(event);
+    }
+  };
+  return tracker;
+}
 
-  if (sessionId) {
+function releaseFailedThread(workspaceRoot, jobId, threadId) {
+  releaseThread(workspaceRoot, jobId, { threadId: threadId ?? undefined, dropIfUnstarted: true });
+}
+
+function findThreadHeldByJob(workspaceRoot, jobId) {
+  if (!jobId) {
     return null;
   }
+  return listThreads(workspaceRoot).find((entry) => entry.activeJobId === jobId) ?? null;
+}
 
-  return findLatestTaskThread(workspaceRoot);
+// Background launches reserve or lock the thread before the worker starts, so
+// a second command sees it as busy immediately. The worker then finds the
+// thread already held by its own job id.
+function holdThreadForBackgroundJob(workspaceRoot, request) {
+  if (request.threadRef) {
+    const entry = resolveThread(workspaceRoot, request.threadRef);
+    return acquireThread(workspaceRoot, entry.name, request.jobId);
+  }
+  if (request.resumeLast || request.ephemeral) {
+    return null;
+  }
+  return reserveThread(workspaceRoot, {
+    name: request.threadName,
+    kind: "task",
+    sandbox: request.write ? "workspace-write" : "read-only",
+    model: request.model ?? null,
+    sessionId: getCurrentClaudeSessionId(),
+    jobId: request.jobId,
+    prompt: request.prompt
+  });
+}
+
+async function resolveTaskThread(workspaceRoot, request) {
+  const held = findThreadHeldByJob(workspaceRoot, request.jobId);
+  if (held) {
+    return { entry: held, fallbackThreadId: null };
+  }
+  if (request.threadRef) {
+    const entry = resolveThread(workspaceRoot, request.threadRef);
+    return { entry: acquireThread(workspaceRoot, entry.name, request.jobId), fallbackThreadId: null };
+  }
+  if (request.resumeLast) {
+    const latest = findLatestThread(workspaceRoot, { kind: "task", includeBusy: true });
+    if (latest) {
+      return { entry: acquireThread(workspaceRoot, latest.name, request.jobId), fallbackThreadId: null };
+    }
+    const fallback = await findLatestTaskThread(workspaceRoot);
+    if (!fallback) {
+      throw new Error("No previous Codex task thread was found for this repository.");
+    }
+    return { entry: null, fallbackThreadId: fallback.id };
+  }
+  return { entry: null, fallbackThreadId: null };
 }
 
 async function executeReviewRun(request) {
@@ -464,53 +506,94 @@ async function executeTaskRun(request) {
 
   const taskMetadata = buildTaskRunMetadata({
     prompt: request.prompt,
-    resumeLast: request.resumeLast
+    resumeLast: Boolean(request.resumeLast || request.threadRef)
   });
+  const prompt = request.prompt?.trim() || "";
 
-  let resumeThreadId = null;
-  if (request.resumeLast) {
-    const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
-      excludeJobId: request.jobId
-    });
-    if (!latestThread) {
-      throw new Error("No previous Codex task thread was found for this repository.");
+  let { entry, fallbackThreadId } = await resolveTaskThread(workspaceRoot, request);
+  let sandbox = request.write ? "workspace-write" : "read-only";
+  let model = request.model ?? null;
+  let resumeThreadId = fallbackThreadId;
+
+  if (entry?.threadId) {
+    resumeThreadId = entry.threadId;
+    if (!request.write) {
+      sandbox = entry.sandbox;
     }
-    resumeThreadId = latestThread.id;
+    if (!model) {
+      model = entry.model;
+    }
+  } else if (!entry && !resumeThreadId && !request.ephemeral) {
+    entry = reserveThread(workspaceRoot, {
+      name: request.threadName,
+      kind: "task",
+      sandbox,
+      model,
+      sessionId: getCurrentClaudeSessionId(),
+      jobId: request.jobId,
+      prompt
+    });
   }
 
-  if (!request.prompt && !resumeThreadId) {
-    throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
+  if (entry && request.jobId) {
+    upsertJob(workspaceRoot, { id: request.jobId, threadName: entry.name });
   }
 
-  const result = await runAppServerTurn(workspaceRoot, {
-    resumeThreadId,
-    prompt: request.prompt,
-    defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
-    model: request.model,
-    effort: request.effort,
-    sandbox: request.write ? "workspace-write" : "read-only",
-    onProgress: request.onProgress,
-    persistThread: true,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
-  });
+  const tracker = trackStartedThread(request.onProgress);
+  let result;
+  try {
+    if (!prompt && !resumeThreadId) {
+      throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
+    }
+    result = await runAppServerTurn(workspaceRoot, {
+      resumeThreadId,
+      prompt,
+      defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
+      model,
+      effort: request.effort,
+      sandbox,
+      onProgress: tracker.onProgress,
+      persistThread: Boolean(entry),
+      threadName: entry && !resumeThreadId ? buildRegisteredThreadName(entry.name) : null
+    });
+  } catch (error) {
+    if (entry) {
+      releaseFailedThread(workspaceRoot, request.jobId, tracker.threadId);
+    }
+    throw error;
+  }
+
+  if (entry) {
+    const [released] = releaseThread(workspaceRoot, request.jobId, {
+      threadId: result.threadId,
+      lastPrompt: prompt || DEFAULT_CONTINUE_PROMPT,
+      lastJobId: request.jobId,
+      turnCompleted: result.status === 0
+    });
+    entry = released ?? entry;
+  }
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
   const failureMessage = result.error?.message ?? result.stderr ?? "";
-  const rendered = renderTaskResult(
-    {
-      rawOutput,
-      failureMessage,
-      reasoningSummary: result.reasoningSummary
-    },
-    {
-      title: taskMetadata.title,
-      jobId: request.jobId ?? null,
-      write: Boolean(request.write)
-    }
+  const rendered = appendThreadBlock(
+    renderTaskResult(
+      {
+        rawOutput,
+        failureMessage,
+        reasoningSummary: result.reasoningSummary
+      },
+      {
+        title: taskMetadata.title,
+        jobId: request.jobId ?? null,
+        write: Boolean(request.write)
+      }
+    ),
+    threadSummary(entry)
   );
   const payload = {
     status: result.status,
     threadId: result.threadId,
+    thread: threadSummary(entry),
     rawOutput,
     touchedFiles: result.touchedFiles,
     reasoningSummary: result.reasoningSummary
@@ -554,7 +637,8 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
 }
 
 function renderQueuedTaskLaunch(payload) {
-  return `${payload.title} started in the background as ${payload.jobId}. Check /cx:status ${payload.jobId} for progress.\n`;
+  const thread = payload.threadName ? ` on thread ${payload.threadName}` : "";
+  return `${payload.title} started in the background as ${payload.jobId}${thread}. Check /cx:status ${payload.jobId} for progress.\n`;
 }
 
 function getJobKindLabel(kind, jobClass) {
@@ -589,28 +673,20 @@ function createTrackedProgress(job, options = {}) {
   };
 }
 
-function buildTaskJob(workspaceRoot, taskMetadata, write) {
-  return createCompanionJob({
-    prefix: "task",
-    kind: "task",
-    title: taskMetadata.title,
-    workspaceRoot,
-    jobClass: "task",
-    summary: taskMetadata.summary,
-    write
-  });
-}
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
-  return {
-    cwd,
-    model,
-    effort,
-    prompt,
-    write,
-    resumeLast,
-    jobId
-  };
+function buildTaskRequest({
+  cwd,
+  model,
+  effort,
+  prompt,
+  write,
+  resumeLast,
+  jobId,
+  threadName = null,
+  threadRef = null,
+  ephemeral = false
+}) {
+  return { cwd, model, effort, prompt, write, resumeLast, jobId, threadName, threadRef, ephemeral };
 }
 
 function renderTransferResult(payload) {
@@ -759,10 +835,87 @@ async function handleReview(argv) {
   });
 }
 
+function validateTaskFlags(options) {
+  const resumeLast = Boolean(options["resume-last"] || options.resume);
+  if (resumeLast && options.fresh) {
+    throw new Error("Choose either --resume/--resume-last or --fresh.");
+  }
+  if (options.name && options.thread) {
+    throw new Error("Choose either --name (start a new thread) or --thread (continue one).");
+  }
+  if (options.thread && (options.fresh || resumeLast)) {
+    throw new Error("--thread cannot be combined with --fresh or --resume-last.");
+  }
+  if (options.name && (resumeLast || options.ephemeral)) {
+    throw new Error("--name cannot be combined with --resume-last or --ephemeral.");
+  }
+  if (options.thread && options.ephemeral) {
+    throw new Error("--thread cannot be combined with --ephemeral.");
+  }
+  if (options.name) {
+    validateThreadName(options.name);
+  }
+  return resumeLast;
+}
+
+async function launchTask({ cwd, workspaceRoot, options, prompt, resumeLast, threadName, threadRef, ephemeral, title, summary }) {
+  const model = normalizeRequestedModel(options.model);
+  const effort = normalizeReasoningEffort(options.effort);
+  const write = Boolean(options.write);
+  const job = createCompanionJob({
+    prefix: "task",
+    kind: "task",
+    title,
+    workspaceRoot,
+    jobClass: "task",
+    summary,
+    write
+  });
+  const request = buildTaskRequest({
+    cwd,
+    model,
+    effort,
+    prompt,
+    write,
+    resumeLast,
+    jobId: job.id,
+    threadName,
+    threadRef,
+    ephemeral
+  });
+
+  if (options.background) {
+    ensureCodexAvailable(cwd);
+    requireTaskRequest(prompt, resumeLast || Boolean(threadRef));
+    const held = holdThreadForBackgroundJob(workspaceRoot, request);
+    if (held) {
+      job.threadName = held.name;
+    }
+    let payload;
+    try {
+      ({ payload } = enqueueBackgroundTask(cwd, job, request));
+    } catch (error) {
+      releaseThread(workspaceRoot, job.id, { dropIfUnstarted: true });
+      throw error;
+    }
+    if (held) {
+      payload.threadName = held.name;
+    }
+    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
+    return;
+  }
+
+  await runForegroundCommand(
+    job,
+    (progress) => executeTaskRun({ ...request, onProgress: progress }),
+    { json: options.json }
+  );
+}
+
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "name", "thread"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "ephemeral"],
     aliasMap: {
       m: "model"
     }
@@ -770,56 +923,22 @@ async function handleTask(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const model = normalizeRequestedModel(options.model);
-  const effort = normalizeReasoningEffort(options.effort);
+  const resumeLast = validateTaskFlags(options);
   const prompt = readTaskPrompt(cwd, options, positionals);
+  const taskMetadata = buildTaskRunMetadata({ prompt, resumeLast: resumeLast || Boolean(options.thread) });
 
-  const resumeLast = Boolean(options["resume-last"] || options.resume);
-  const fresh = Boolean(options.fresh);
-  if (resumeLast && fresh) {
-    throw new Error("Choose either --resume/--resume-last or --fresh.");
-  }
-  const write = Boolean(options.write);
-  const taskMetadata = buildTaskRunMetadata({
+  await launchTask({
+    cwd,
+    workspaceRoot,
+    options,
     prompt,
-    resumeLast
+    resumeLast,
+    threadName: options.name ?? null,
+    threadRef: options.thread ?? null,
+    ephemeral: Boolean(options.ephemeral),
+    title: taskMetadata.title,
+    summary: taskMetadata.summary
   });
-
-  if (options.background) {
-    ensureCodexAvailable(cwd);
-    requireTaskRequest(prompt, resumeLast);
-
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-    const request = buildTaskRequest({
-      cwd,
-      model,
-      effort,
-      prompt,
-      write,
-      resumeLast,
-      jobId: job.id
-    });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
-    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
-    return;
-  }
-
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeTaskRun({
-        cwd,
-        model,
-        effort,
-        prompt,
-        write,
-        resumeLast,
-        jobId: job.id,
-        onProgress: progress
-      }),
-    { json: options.json }
-  );
 }
 
 async function handleTransfer(argv) {
@@ -931,32 +1050,26 @@ function handleTaskResumeCandidate(argv) {
     booleanOptions: ["json"]
   });
 
-  const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const sessionId = getCurrentClaudeSessionId();
-  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
-  const candidate = findLatestResumableTaskJob(jobs);
-
+  const candidate = findLatestThread(workspaceRoot, { kind: "task", includeBusy: false });
   const payload = {
     available: Boolean(candidate),
-    sessionId,
-    candidate:
-      candidate == null
-        ? null
-        : {
-            id: candidate.id,
-            status: candidate.status,
-            title: candidate.title ?? null,
-            summary: candidate.summary ?? null,
-            threadId: candidate.threadId,
-            completedAt: candidate.completedAt ?? null,
-            updatedAt: candidate.updatedAt ?? null
-          }
+    sessionId: getCurrentClaudeSessionId(),
+    candidate: candidate
+      ? {
+          name: candidate.name,
+          threadId: candidate.threadId,
+          kind: candidate.kind,
+          updatedAt: candidate.updatedAt,
+          lastPrompt: candidate.lastPrompt ?? "",
+          lastJobId: candidate.lastJobId ?? null,
+          ageLabel: formatRelativeTime(candidate.updatedAt)
+        }
+      : null
   };
-
   const rendered = candidate
-    ? `Resumable task found: ${candidate.id} (${candidate.status}).\n`
-    : "No resumable task found for this session.\n";
+    ? `Resumable thread found: ${candidate.name} (${payload.candidate.ageLabel}: "${payload.candidate.lastPrompt}").\n`
+    : "No resumable Codex task thread in this repository.\n";
   outputCommandResult(payload, rendered, options.json);
 }
 
@@ -1009,6 +1122,7 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user.",
     completedAt
   });
+  releaseFailedThread(workspaceRoot, job.id, threadId);
 
   const payload = {
     jobId: job.id,
