@@ -80,6 +80,9 @@ const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
+// Set by the spike recorded in docs/superpowers/spikes/2026-10-08-native-review-follow-up.md.
+const NATIVE_REVIEW_REGISTERS = "sourceThreadId";
+const NATIVE_REVIEW_FOLLOW_UP = true;
 
 function printUsage() {
   console.log(
@@ -407,17 +410,65 @@ async function executeReviewRun(request) {
   });
   const focusText = request.focusText?.trim() ?? "";
   const reviewName = request.reviewName ?? "Review";
-  if (reviewName === "Review") {
-    const reviewTarget = validateNativeReviewRequest(target, focusText);
-    const result = await runAppServerReview(request.cwd, {
-      target: reviewTarget,
-      model: request.model,
-      onProgress: request.onProgress
+  const workspaceRoot = resolveWorkspaceRoot(request.cwd);
+  const reviewTarget = reviewName === "Review" ? validateNativeReviewRequest(target, focusText) : null;
+  const reservedPrompt = `${reviewName} ${target.label}${focusText ? `: ${focusText}` : ""}`;
+  const entry = request.ephemeral
+    ? null
+    : reserveThread(workspaceRoot, {
+        name: request.threadName,
+        kind: reviewName === "Review" ? "review" : "adversarial-review",
+        sandbox: "read-only",
+        model: request.model ?? null,
+        sessionId: getCurrentClaudeSessionId(),
+        jobId: request.jobId,
+        prompt: reservedPrompt
+      });
+  if (entry && request.jobId) {
+    upsertJob(workspaceRoot, { id: request.jobId, threadName: entry.name });
+  }
+  const codexThreadName = entry ? buildRegisteredThreadName(entry.name) : null;
+  const tracker = trackStartedThread(request.onProgress);
+  const runRegistered = async (runner) => {
+    try {
+      return await runner();
+    } catch (error) {
+      if (entry) {
+        releaseFailedThread(workspaceRoot, request.jobId, tracker.threadId);
+      }
+      throw error;
+    }
+  };
+  const finishThread = (result, registeredThreadId) => {
+    if (!entry) {
+      return null;
+    }
+    const [released] = releaseThread(workspaceRoot, request.jobId, {
+      threadId: registeredThreadId,
+      lastPrompt: reservedPrompt,
+      lastJobId: request.jobId,
+      turnCompleted: result.status === 0
     });
+    return threadSummary(released ?? entry);
+  };
+
+  if (reviewName === "Review") {
+    const result = await runRegistered(() =>
+      runAppServerReview(request.cwd, {
+        target: reviewTarget,
+        model: request.model,
+        onProgress: tracker.onProgress,
+        persistThread: Boolean(entry),
+        threadName: codexThreadName
+      })
+    );
+    const registeredThreadId = result[NATIVE_REVIEW_REGISTERS] ?? result.threadId;
+    const thread = finishThread(result, registeredThreadId);
     const payload = {
       review: reviewName,
       target,
-      threadId: result.threadId,
+      thread,
+      threadId: registeredThreadId,
       sourceThreadId: result.sourceThreadId,
       codex: {
         status: result.status,
@@ -426,18 +477,21 @@ async function executeReviewRun(request) {
         reasoning: result.reasoningSummary
       }
     };
-    const rendered = renderNativeReviewResult(
-      {
-        status: result.status,
-        stdout: result.reviewText,
-        stderr: result.stderr
-      },
-      { reviewLabel: reviewName, targetLabel: target.label, reasoningSummary: result.reasoningSummary }
+    const rendered = appendThreadBlock(
+      renderNativeReviewResult(
+        {
+          status: result.status,
+          stdout: result.reviewText,
+          stderr: result.stderr
+        },
+        { reviewLabel: reviewName, targetLabel: target.label, reasoningSummary: result.reasoningSummary }
+      ),
+      thread
     );
 
     return {
       exitStatus: result.status,
-      threadId: result.threadId,
+      threadId: registeredThreadId,
       turnId: result.turnId,
       payload,
       rendered,
@@ -450,13 +504,18 @@ async function executeReviewRun(request) {
 
   const context = collectReviewContext(request.cwd, target);
   const prompt = buildAdversarialReviewPrompt(context, focusText);
-  const result = await runAppServerTurn(context.repoRoot, {
-    prompt,
-    model: request.model,
-    sandbox: "read-only",
-    outputSchema: readOutputSchema(REVIEW_SCHEMA),
-    onProgress: request.onProgress
-  });
+  const result = await runRegistered(() =>
+    runAppServerTurn(context.repoRoot, {
+      prompt,
+      model: request.model,
+      sandbox: "read-only",
+      outputSchema: readOutputSchema(REVIEW_SCHEMA),
+      onProgress: tracker.onProgress,
+      persistThread: Boolean(entry),
+      threadName: codexThreadName
+    })
+  );
+  const thread = finishThread(result, result.threadId);
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
     failureMessage: result.error?.message ?? result.stderr
@@ -464,6 +523,7 @@ async function executeReviewRun(request) {
   const payload = {
     review: reviewName,
     target,
+    thread,
     threadId: result.threadId,
     context: {
       repoRoot: context.repoRoot,
@@ -487,11 +547,14 @@ async function executeReviewRun(request) {
     threadId: result.threadId,
     turnId: result.turnId,
     payload,
-    rendered: renderReviewResult(parsed, {
-      reviewLabel: reviewName,
-      targetLabel: context.target.label,
-      reasoningSummary: result.reasoningSummary
-    }),
+    rendered: appendThreadBlock(
+      renderReviewResult(parsed, {
+        reviewLabel: reviewName,
+        targetLabel: context.target.label,
+        reasoningSummary: result.reasoningSummary
+      }),
+      thread
+    ),
     summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
     jobTitle: `Codex ${reviewName}`,
     jobClass: "review",
@@ -787,7 +850,7 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "name"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -803,6 +866,9 @@ async function handleReviewCommand(argv, config) {
   });
 
   config.validateRequest?.(target, focusText);
+  if (options.name) {
+    validateThreadName(options.name);
+  }
   const metadata = buildReviewJobMetadata(config.reviewName, target);
   const job = createCompanionJob({
     prefix: "review",
@@ -822,6 +888,8 @@ async function handleReviewCommand(argv, config) {
         model: options.model,
         focusText,
         reviewName: config.reviewName,
+        threadName: options.name ?? null,
+        jobId: job.id,
         onProgress: progress
       }),
     { json: options.json }

@@ -2403,3 +2403,66 @@ test("cancel releases the thread lock", async () => {
   assert.equal(cancelled.status, 0, cancelled.stderr);
   assert.equal(readRegistry(repo).threads[0].activeJobId, null);
 });
+
+function seedDirtyRepo() {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+  return { repo, binDir, env: buildEnv(binDir), statePath: path.join(binDir, "fake-codex-state.json") };
+}
+
+test("review registers a persistent named thread", () => {
+  const { repo, env, statePath } = seedDirtyRepo();
+  const result = run("node", [SCRIPT, "review", "--name", "pr-review"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /No material issues found/);
+  assert.match(result.stdout, /Thread: pr-review \(thr_1\)\nFollow up: \/cx:ask pr-review <question>/);
+
+  const registry = readRegistry(repo);
+  assert.equal(registry.threads[0].name, "pr-review");
+  assert.equal(registry.threads[0].kind, "review");
+  assert.equal(registry.threads[0].sandbox, "read-only");
+  assert.equal(registry.threads[0].threadId, "thr_1");
+  assert.equal(registry.threads[0].turns, 1);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.threads.find((t) => t.id === "thr_1").ephemeral, false);
+  assert.equal(fakeState.threads.find((t) => t.id === "thr_1").name, "cx:pr-review");
+});
+
+test("review auto-names its thread review-N", () => {
+  const { repo, env } = seedDirtyRepo();
+  run("node", [SCRIPT, "review"], { cwd: repo, env });
+  const second = run("node", [SCRIPT, "review"], { cwd: repo, env });
+  assert.equal(second.status, 0, second.stderr);
+  assert.deepEqual(readRegistry(repo).threads.map((t) => t.name), ["review-2", "review-1"]);
+});
+
+test("adversarial review registers an adv-N thread that task --thread can continue", () => {
+  const { repo, env, statePath } = seedDirtyRepo();
+  const review = run("node", [SCRIPT, "adversarial-review", "challenge the design"], { cwd: repo, env });
+  assert.equal(review.status, 0, review.stderr);
+  assert.match(review.stdout, /Thread: adv-1 \(thr_1\)/);
+  assert.equal(readRegistry(repo).threads[0].kind, "adversarial-review");
+
+  const follow = run("node", [SCRIPT, "task", "--thread", "adv-1", "follow up on finding 1"], { cwd: repo, env });
+  assert.equal(follow.status, 0, follow.stderr);
+  assert.match(follow.stdout, /Resumed the prior run/);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
+  assert.equal(fakeState.lastResume.sandbox, "read-only");
+});
+
+test("review --name rejects a duplicate name before contacting Codex", () => {
+  const { repo, env } = seedDirtyRepo();
+  run("node", [SCRIPT, "review", "--name", "dup"], { cwd: repo, env });
+  const again = run("node", [SCRIPT, "review", "--name", "dup"], { cwd: repo, env });
+  assert.equal(again.status, 1);
+  assert.match(again.stderr, /A thread named "dup" already exists/);
+});
