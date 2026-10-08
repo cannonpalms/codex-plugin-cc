@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [what Codex should investigate, solve, or continue]"
+argument-hint: "[--background|--wait] [--resume|--fresh|--thread <ref>|--name <thread>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [what Codex should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -20,17 +20,19 @@ Execution mode:
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.
 - If the request includes `--fresh`, do not ask whether to continue. The user already chose.
-- Otherwise, before starting Codex, check for a resumable rescue thread from this Claude session by running:
+- If the request includes `--thread <ref>` or `--name <thread>`, do not ask whether to continue. Forward them unchanged.
+- Otherwise, before starting Codex, check for a resumable rescue thread in this repository by running:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate --json
 ```
 
 - If that helper reports `available: true`, use `AskUserQuestion` exactly once to ask whether to continue the current Codex thread or start a new one.
+- The helper's JSON names the thread: `candidate.name`, `candidate.ageLabel`, and `candidate.lastPrompt`. The thread may come from an earlier Claude session.
 - The two choices must be:
-  - `Continue current Codex thread`
+  - `Continue thread <candidate.name> (<candidate.ageLabel>: "<candidate.lastPrompt>")`
   - `Start a new Codex thread`
-- If the user is clearly giving a follow-up instruction such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", put `Continue current Codex thread (Recommended)` first.
+- If the user is clearly giving a follow-up instruction such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", put the continue option first and suffix it with `(Recommended)`.
 - Otherwise put `Start a new Codex thread (Recommended)` first.
 - If the user chooses continue, add `--resume` before routing to the subagent.
 - If the user chooses a new thread, add `--fresh` before routing to the subagent.
@@ -45,5 +47,6 @@ Operating rules:
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
 - Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.
 - Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
+- Leave `--thread` and `--name` in the forwarded request. The subagent maps them to `task --thread` and `task --name`.
 - If the helper reports that Codex is missing or unauthenticated, stop and tell the user to run `/cx:setup`.
 - If the user did not supply a request, ask what Codex should investigate or fix.

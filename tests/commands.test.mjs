@@ -74,12 +74,15 @@ test("continue is not exposed as a user-facing command", () => {
   const commandFiles = fs.readdirSync(path.join(PLUGIN_ROOT, "commands")).sort();
   assert.deepEqual(commandFiles, [
     "adversarial-review.md",
+    "ask.md",
     "cancel.md",
+    "forget.md",
     "rescue.md",
     "result.md",
     "review.md",
     "setup.md",
     "status.md",
+    "threads.md",
     "transfer.md"
   ]);
 });
@@ -107,7 +110,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh>/);
   assert.match(rescue, /task-resume-candidate --json/);
   assert.match(rescue, /AskUserQuestion/);
-  assert.match(rescue, /Continue current Codex thread/);
+  assert.match(rescue, /Continue thread <candidate\.name>/);
   assert.match(rescue, /Start a new Codex thread/);
   assert.match(rescue, /run the `cx:codex-rescue` subagent in the background/i);
   assert.match(rescue, /default to foreground/i);
@@ -254,4 +257,63 @@ test("plugin and marketplace manifests are named cx", () => {
   assert.equal(marketplace.name, "cx");
   assert.equal(marketplace.plugins[0].name, "cx");
   assert.equal(marketplace.plugins[0].source, "./plugins/codex");
+});
+
+test("ask command forwards to the ask subcommand verbatim and never fixes code", () => {
+  const source = read("commands/ask.md");
+  assert.match(source, /argument-hint: '<thread> \[--wait\|--background\] \[--write\] <question>'/);
+  assert.match(source, /disable-model-invocation: true/);
+  assert.match(source, /codex-companion\.mjs" ask "\$ARGUMENTS"/);
+  assert.match(source, /run_in_background:\s*true/);
+  assert.match(source, /Return the command stdout verbatim/i);
+  assert.match(source, /Do not fix issues/i);
+  assert.match(source, /\/cx:threads/);
+});
+
+test("threads and forget commands are inline bang commands", () => {
+  const threads = read("commands/threads.md");
+  assert.match(threads, /!`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" threads "\$ARGUMENTS"`/);
+  assert.match(threads, /disable-model-invocation: true/);
+  const forget = read("commands/forget.md");
+  assert.match(forget, /!`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" forget "\$ARGUMENTS"`/);
+  assert.match(forget, /argument-hint: '<thread>'/);
+});
+
+test("review commands document --name and the follow-up hint", () => {
+  for (const file of ["commands/review.md", "commands/adversarial-review.md"]) {
+    const source = read(file);
+    assert.match(source, /\[--name <thread>\]/, file);
+    assert.match(source, /\/cx:ask/, file);
+  }
+});
+
+test("rescue command asks about the named candidate thread and forwards --thread", () => {
+  const source = read("commands/rescue.md");
+  assert.match(source, /task-resume-candidate --json/);
+  assert.match(source, /candidate\.name/);
+  assert.match(source, /ageLabel/);
+  assert.match(source, /--thread <ref>/);
+  assert.match(source, /--name <thread>/);
+});
+
+test("rescue agent and runtime skill pass --name and --thread through to task", () => {
+  const agent = read("agents/codex-rescue.md");
+  assert.match(agent, /--thread/);
+  assert.match(agent, /--name/);
+  assert.match(agent, /`--resume` means add `--resume-last`/);
+  const runtime = read("skills/codex-cli-runtime/SKILL.md");
+  assert.match(runtime, /task --thread <ref>/);
+  assert.match(runtime, /task --name <thread>/);
+});
+
+test("follow-up skill maps natural language to ask", () => {
+  const source = read("skills/cx-follow-up/SKILL.md");
+  assert.match(source, /^name: cx-follow-up$/m);
+  assert.match(source, /ask that reviewer/i);
+  assert.match(source, /threads --json/);
+  assert.match(source, /codex-companion\.mjs" ask/);
+  assert.match(source, /verbatim/i);
+  assert.match(source, /AskUserQuestion/);
+  assert.match(source, /Never answer on Codex's behalf/i);
+  assert.doesNotMatch(source, /user-invocable: false/);
 });

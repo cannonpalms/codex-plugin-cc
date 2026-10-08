@@ -30,6 +30,9 @@ Command selection:
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
+- If the forwarded request includes `--thread <ref>`, pass `task --thread <ref>` and strip the token from the task text.
+- If the forwarded request includes `--name <thread>`, pass `task --name <thread>` and strip the token from the task text.
+- `--thread` and `--resume-last` are mutually exclusive; `--thread` wins when both are present.
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
 - `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
 - `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.

@@ -12,4 +12,5 @@ Present the full command output to the user. Do not summarize or condense it. Pr
 - The complete result payload, including verdict, summary, findings, details, artifacts, and next steps
 - File paths and line numbers exactly as reported
 - Any error messages or parse errors
+- Thread name and the `Follow up:` line
 - Follow-up commands such as `/cx:status <id>` and `/cx:review`
