@@ -99,6 +99,88 @@ function escapeMarkdownCell(value) {
     .trim();
 }
 
+function shortenCell(text, limit) {
+  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
+  if (normalized.length <= limit) {
+    return normalized;
+  }
+  return `${normalized.slice(0, limit - 3)}...`;
+}
+
+export function formatRelativeTime(iso, now = Date.now()) {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) {
+    return "";
+  }
+  const seconds = Math.max(0, Math.round((now - then) / 1000));
+  if (seconds < 60) {
+    return "just now";
+  }
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes} min ago`;
+  }
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) {
+    return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  }
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
+}
+
+export function renderThreadBlock(thread) {
+  if (!thread?.name || !thread?.threadId) {
+    return "";
+  }
+  return `${[
+    `Thread: ${thread.name} (${thread.threadId})`,
+    `Follow up: /cx:ask ${thread.name} <question>`,
+    `Resume in Codex: codex resume ${thread.threadId}`
+  ].join("\n")}\n`;
+}
+
+export function appendThreadBlock(rendered, thread) {
+  const block = renderThreadBlock(thread);
+  if (!block) {
+    return rendered;
+  }
+  const base = rendered.endsWith("\n") ? rendered : `${rendered}\n`;
+  return `${base}\n${block}`;
+}
+
+export function renderThreadsReport(threads) {
+  if (threads.length === 0) {
+    return `${[
+      "No Codex threads in this repository.",
+      "Start one with /cx:review --name <name>, /cx:adversarial-review --name <name>, or /cx:rescue --name <name>."
+    ].join("\n")}\n`;
+  }
+  const lines = [
+    "# Codex Threads",
+    "",
+    "| Thread | Kind | State | Turns | Updated | Last prompt |",
+    "| --- | --- | --- | --- | --- | --- |"
+  ];
+  for (const thread of threads) {
+    const state = thread.busy ? `busy ${thread.activeJobId}` : thread.threadId ? "idle" : "starting";
+    lines.push(
+      `| ${escapeMarkdownCell(thread.name)} | ${escapeMarkdownCell(thread.kind)} | ${escapeMarkdownCell(state)} | ${thread.turns ?? 0} | ${escapeMarkdownCell(formatRelativeTime(thread.updatedAt))} | ${escapeMarkdownCell(shortenCell(thread.lastPrompt, 48))} |`
+    );
+  }
+  lines.push("", "Follow up: /cx:ask <thread> <question>");
+  return `${lines.join("\n")}\n`;
+}
+
+function appendSessionFooter(output, threadId, thread) {
+  if (thread?.name && thread?.threadId) {
+    return appendThreadBlock(output, thread);
+  }
+  if (!threadId) {
+    return output;
+  }
+  return `${output}\nCodex session ID: ${threadId}\nResume in Codex: codex resume ${threadId}\n`;
+}
+
 function formatCodexResumeCommand(job) {
   if (!job?.threadId) {
     return null;
@@ -108,15 +190,15 @@ function formatCodexResumeCommand(job) {
 
 function appendActiveJobsTable(lines, jobs) {
   lines.push("Active jobs:");
-  lines.push("| Job | Kind | Status | Phase | Elapsed | Codex Session ID | Summary | Actions |");
-  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+  lines.push("| Job | Kind | Status | Phase | Elapsed | Thread | Codex Session ID | Summary | Actions |");
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const job of jobs) {
     const actions = [`/cx:status ${job.id}`];
     if (job.status === "queued" || job.status === "running") {
       actions.push(`/cx:cancel ${job.id}`);
     }
     lines.push(
-      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
+      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadName ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
     );
   }
 }
@@ -141,6 +223,10 @@ function pushJobDetails(lines, job, options = {}) {
   const resumeCommand = formatCodexResumeCommand(job);
   if (resumeCommand) {
     lines.push(`  Resume in Codex: ${resumeCommand}`);
+  }
+  if (job.threadName) {
+    lines.push(`  Thread: ${job.threadName}`);
+    lines.push(`  Follow up: /cx:ask ${job.threadName} <question>`);
   }
   if (job.logFile && options.showLog) {
     lines.push(`  Log: ${job.logFile}`);
@@ -390,12 +476,10 @@ export function renderJobStatusReport(job) {
 export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
+  const thread = storedJob?.result?.thread ?? null;
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
-    if (!threadId) {
-      return output;
-    }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return appendSessionFooter(output, threadId, thread);
   }
 
   const rawOutput =
@@ -404,18 +488,12 @@ export function renderStoredJobResult(job, storedJob) {
     "";
   if (rawOutput) {
     const output = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
-    if (!threadId) {
-      return output;
-    }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return appendSessionFooter(output, threadId, thread);
   }
 
   if (storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
-    if (!threadId) {
-      return output;
-    }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return appendSessionFooter(output, threadId, thread);
   }
 
   const lines = [
@@ -428,6 +506,10 @@ export function renderStoredJobResult(job, storedJob) {
   if (threadId) {
     lines.push(`Codex session ID: ${threadId}`);
     lines.push(`Resume in Codex: ${resumeCommand}`);
+  }
+  if (thread?.name) {
+    lines.push(`Thread: ${thread.name}`);
+    lines.push(`Follow up: /cx:ask ${thread.name} <question>`);
   }
 
   if (job.summary) {
