@@ -2526,3 +2526,26 @@ git commit -m "Document named threads and release 1.1.0"
 - Spec 7 spike: Task 1, consumed in Task 7 and Task 8's notice.
 - Spec 8 tests: Tasks 3, 5, 6, 7, 8, 9, 10. The two upstream tests that change meaning are rewritten in Task 6. The session-end hook test (registry survives cleanup) is covered by `tests/threads.test.mjs` "the registry survives saveState", which is the function the hook calls.
 - Spec 9 docs and version: Task 11.
+
+## Implementation notes (2026-10-08)
+
+Where the code differs from the steps above:
+
+- Background launches (`task --background`, `ask --background`) reserve or
+  lock the thread in the launching process, not in the worker, so a second
+  command sees the thread as busy at once. The worker finds the thread already
+  held by its own job id (`holdThreadForBackgroundJob`, `findThreadHeldByJob`).
+- A run that fails or is cancelled after Codex created the thread keeps its
+  registry entry. The runner remembers the first thread id reported through
+  progress events (`trackStartedThread`, `releaseFailedThread`). Only a run
+  that never got a thread id is dropped.
+- `scripts/bump-version.mjs` and its test looked the plugin up by the name
+  `codex` in the marketplace manifest; both now use `cx`.
+- Upstream tests that compared exact task output use `assertTaskOutput`, which
+  checks Codex's text and then the thread footer. Two command tests were
+  updated for the new command files and the reworded rescue question.
+- Task 11 step 5 was run through `codex-companion.mjs` directly against Codex
+  CLI 0.161.0, not through installed slash commands. Review, ask, adversarial
+  review, background ask, busy rejection, survival across a session-end hook,
+  and forget all behaved as specified. Installing the plugin in Claude Code
+  and trying the `cx-follow-up` skill in plain words is still to do.

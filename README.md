@@ -1,17 +1,16 @@
-# Codex plugin for Claude Code
+# cx: Codex threads for Claude Code
 
-Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
+Use Codex from inside Claude Code for code reviews or to delegate tasks, and keep talking to the same Codex conversation afterwards.
 
-This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
-they already have.
-
-<video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
+This is a fork of [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc). Every Codex run it starts is a named, persistent thread. You can come back to any of them later, by name, with a follow-up question or instruction, and Codex answers with its full earlier context. The plugin is named `cx` so it can be installed beside the upstream `codex` plugin.
 
 ## What You Get
 
 - `/cx:review` for a normal read-only Codex review
 - `/cx:adversarial-review` for a steerable challenge review
-- `/cx:rescue`, `/cx:transfer`, `/cx:status`, `/cx:result`, and `/cx:cancel` to delegate work, hand off sessions, and manage background jobs
+- `/cx:rescue` to delegate a task to Codex
+- `/cx:ask` to send a follow-up to any earlier review or task, `/cx:threads` to list them, and `/cx:forget` to drop one
+- `/cx:transfer`, `/cx:status`, `/cx:result`, and `/cx:cancel` to hand off sessions and manage background jobs
 
 ## Requirements
 
@@ -72,6 +71,34 @@ One simple first run is:
 /cx:result
 ```
 
+## Threads
+
+Every review, adversarial review and rescue runs on its own Codex thread. The plugin records each thread by name, per repository, so a thread started in one Claude Code session is still there in the next.
+
+- Pass `--name <thread>` to choose the name. Names are lowercase letters, digits, `.`, `_` and `-`.
+- Without `--name` the plugin picks `review-N`, `adv-N` or `task-N`.
+- Each result ends with the thread name and a ready-made follow-up command:
+
+```text
+Thread: pr-412 (01a11c22-078d-7693-aeb0-4881b876131f)
+Follow up: /cx:ask pr-412 <question>
+Resume in Codex: codex resume 01a11c22-078d-7693-aeb0-4881b876131f
+```
+
+A typical exchange:
+
+```bash
+/cx:review --name pr-412 --base main
+/cx:ask pr-412 elaborate on the race you flagged in the cache layer
+/cx:threads
+```
+
+You can also say it in plain words. "Ask that reviewer to elaborate on the second finding" finds the most recent review thread and sends the question to it.
+
+Several threads can run at once. A single thread takes one turn at a time, so `/cx:ask` on a thread that is still working reports the job that holds it.
+
+Each follow-up re-sends the thread's history to Codex, so a very long-lived thread costs more per question. Start a fresh one when the topic changes.
+
 ## Usage
 
 ### `/cx:review`
@@ -86,7 +113,7 @@ Use it when you want:
 - a review of your current uncommitted changes
 - a review of your branch compared to a base branch like `main`
 
-Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/cx:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
+Use `--base <ref>` for branch review. It also supports `--wait`, `--background` and `--name <thread>`. The review itself does not take custom focus text, but you can question it afterwards with [`/cx:ask`](#cxask). Use [`/cx:adversarial-review`](#cxadversarial-review) when you want to challenge a specific decision or risk area.
 
 Examples:
 
@@ -96,7 +123,7 @@ Examples:
 /cx:review --background
 ```
 
-This command is read-only and will not perform any changes. When run in the background you can use [`/cx:status`](#codexstatus) to check on the progress and [`/cx:cancel`](#codexcancel) to cancel the ongoing task.
+This command is read-only and will not perform any changes. When run in the background you can use [`/cx:status`](#cxstatus) to check on the progress and [`/cx:cancel`](#cxcancel) to cancel the ongoing task.
 
 ### `/cx:adversarial-review`
 
@@ -137,7 +164,7 @@ Use it when you want Codex to:
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--resume`, `--fresh`, `--name <thread>` and `--thread <ref>`. If you omit all of the thread flags, the plugin can offer to continue the latest rescue thread for this repo, naming it and saying how old it is. `--name` starts a new thread with that name. `--thread` continues a specific one.
 
 Examples:
 
@@ -145,6 +172,8 @@ Examples:
 /cx:rescue investigate why the tests started failing
 /cx:rescue fix the failing test with the smallest safe patch
 /cx:rescue --resume apply the top fix from the last run
+/cx:rescue --name auth-fix investigate the login redirect loop
+/cx:rescue --thread auth-fix now write a regression test for it
 /cx:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
 /cx:rescue --model spark fix the issue quickly
 /cx:rescue --background investigate the regression
@@ -160,7 +189,33 @@ Ask Codex to redesign the database connection to be more resilient.
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
-- follow-up rescue requests can continue the latest Codex task in the repo
+- follow-up rescue requests can continue the latest Codex task in the repo, including one from an earlier Claude Code session
+
+### `/cx:ask`
+
+Sends a follow-up question or instruction to a named thread.
+
+```bash
+/cx:ask review-2 what did you mean by the second finding?
+/cx:ask adv-1 --background re-check that concern against the new commit
+/cx:ask auth-fix --write apply the fix you proposed
+```
+
+The thread keeps the sandbox it started with, so a reviewer stays read-only. Pass `--write` to let Codex edit files on that turn. It supports `--wait` and `--background` and runs in the foreground by default.
+
+The thread reference is its name or a unique prefix of its Codex session ID.
+
+### `/cx:threads`
+
+Lists the threads recorded for this repository with their kind, whether they are idle or busy, how many turns they have had, and the last prompt.
+
+### `/cx:forget`
+
+Removes a thread from the list. The Codex conversation itself is kept, and the command prints the `codex resume` command for it.
+
+```bash
+/cx:forget review-2
+```
 
 ### `/cx:transfer`
 
@@ -290,6 +345,22 @@ Check out the Codex docs for more [configuration options](https://developers.ope
 Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/cx:result` or `/cx:status` or by selecting it from the list.
 
 This way you can review the Codex work or continue the work there.
+
+### Following Up On A Built-In Review
+
+`/cx:review` uses Codex's built-in reviewer. With Codex CLI 0.161.0 the review runs on the thread the plugin records, and a later `/cx:ask` sees the findings: asked to quote its first finding without re-reading any files, Codex returned it word for word. The check is written up in `docs/superpowers/spikes/2026-10-08-native-review-follow-up.md`.
+
+If a later Codex release changes that, `/cx:adversarial-review --name <thread>` is the dependable choice. It is an ordinary prompt turn, so its thread always carries the findings.
+
+## Merging Upstream
+
+```bash
+git fetch upstream
+git merge upstream/main
+npm test
+```
+
+Expect conflicts in `plugins/codex/commands/*.md` and `README.md` from the `/cx:` rename. Keep the `cx` side. The plugin directory is still `plugins/codex` so other files merge cleanly.
 
 ## FAQ
 
