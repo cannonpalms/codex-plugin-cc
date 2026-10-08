@@ -51,7 +51,8 @@ function buildThread(thread) {
     path: null,
     cwd: thread.cwd,
     cliVersion: "fake-codex",
-    source: "appServer",
+    source: thread.source || "appServer",
+    parentThreadId: thread.parentThreadId || null,
     agentNickname: null,
     agentRole: null,
     gitInfo: null,
@@ -329,6 +330,8 @@ rl.on("line", (line) => {
 
       case "thread/list": {
         let threads = state.threads.slice();
+        const wantsReviewers = (message.params.sourceKinds || []).includes("subAgentReview");
+        threads = threads.filter((thread) => Boolean(thread.parentThreadId) === wantsReviewers);
         if (message.params.cwd) {
           threads = threads.filter((thread) => thread.cwd === message.params.cwd);
         }
@@ -411,6 +414,13 @@ rl.on("line", (line) => {
         if (message.params.delivery === "detached") {
           reviewThread = nextThread(state, thread.cwd, true);
           send({ method: "thread/started", params: { thread: { id: reviewThread.id } } });
+        } else if (BEHAVIOR !== "review-no-reviewer-thread") {
+          // Real Codex runs the reviewer in its own sub-agent session and only
+          // reports that session through thread/list.
+          const reviewer = nextThread(state, thread.cwd, thread.ephemeral);
+          reviewer.source = { subAgent: "review" };
+          reviewer.parentThreadId = thread.id;
+          saveState(state);
         }
         const turnId = nextTurnId(state);
         send({ id: message.id, result: { turn: buildTurn(turnId), reviewThreadId: reviewThread.id } });

@@ -2549,3 +2549,8 @@ Where the code differs from the steps above:
   review, background ask, busy rejection, survival across a session-end hook,
   and forget all behaved as specified. Installing the plugin in Claude Code
   and trying the `cx-follow-up` skill in plain words is still to do.
+- Built-in reviews register the reviewer's own sub-agent session, not the
+  requesting thread. The first spike only proved that the requesting thread
+  could quote the write-up; it holds none of the reviewer's working. See the
+  correction in the spike file and section 7 of the spec. The
+  `NATIVE_REVIEW_REGISTERS` constant from Task 7 is gone.

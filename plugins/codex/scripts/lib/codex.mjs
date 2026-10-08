@@ -1003,6 +1003,32 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
   }
 }
 
+// The built-in reviewer runs in its own sub-agent session. The thread that
+// requested the review only receives the final write-up, so follow-ups must go
+// to the reviewer's session to reach the diffs and commands it worked from.
+// No notification carries that session's id; thread/list is the only source.
+async function findReviewerThreadId(client, cwd, sourceThreadId) {
+  try {
+    const response = await client.request("thread/list", {
+      cwd,
+      limit: 20,
+      sortKey: "updated_at",
+      sourceKinds: ["subAgentReview"]
+    });
+    return response.data.find((thread) => thread.parentThreadId === sourceThreadId)?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function nameThreadBestEffort(client, threadId, name) {
+  try {
+    await client.request("thread/name/set", { threadId, name });
+  } catch {
+    // Naming only helps people find the thread in Codex; the review stands without it.
+  }
+}
+
 export async function runAppServerReview(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
@@ -1045,10 +1071,20 @@ export async function runAppServerReview(cwd, options = {}) {
       }
     );
 
+    let reviewerThreadId = null;
+    if (options.persistThread && delivery === "inline") {
+      reviewerThreadId = await findReviewerThreadId(client, cwd, sourceThreadId);
+      if (reviewerThreadId && options.threadName) {
+        await nameThreadBestEffort(client, reviewerThreadId, options.threadName);
+        await nameThreadBestEffort(client, sourceThreadId, `${options.threadName} (request)`);
+      }
+    }
+
     return {
       status: buildResultStatus(turnState),
       threadId: turnState.threadId,
       sourceThreadId,
+      reviewerThreadId,
       turnId: turnState.turnId,
       reviewText: turnState.reviewText,
       reasoningSummary: turnState.reasoningSummary,

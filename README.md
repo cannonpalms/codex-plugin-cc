@@ -348,9 +348,9 @@ This way you can review the Codex work or continue the work there.
 
 ### Following Up On A Built-In Review
 
-`/cx:review` uses Codex's built-in reviewer. With Codex CLI 0.161.0 the review runs on the thread the plugin records, and a later `/cx:ask` sees the findings: asked to quote its first finding without re-reading any files, Codex returned it word for word. The check is written up in `docs/superpowers/spikes/2026-10-08-native-review-follow-up.md`.
+`/cx:review` uses Codex's built-in reviewer, which Codex runs in a session of its own. The thread that asked for the review only receives the final write-up. The plugin therefore records the reviewer's session, so `/cx:ask` reaches the model that read the diffs and ran the commands. Asked afterwards what it had run, the reviewer listed its shell commands and the files it read from memory.
 
-If a later Codex release changes that, `/cx:adversarial-review --name <thread>` is the dependable choice. It is an ordinary prompt turn, so its thread always carries the findings.
+Codex CLI 0.161.0 does not announce the reviewer's session. The plugin finds it by listing review sub-agent threads and matching the parent. If a Codex release stops reporting it, the plugin falls back to the requesting thread, where follow-ups can discuss the findings as written but not how they were reached. The checks are written up in `docs/superpowers/spikes/2026-10-08-native-review-follow-up.md`.
 
 ## Merging Upstream
 

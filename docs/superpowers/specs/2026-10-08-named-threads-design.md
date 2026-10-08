@@ -272,25 +272,23 @@ body instructs Claude to:
 
 The stop-review-gate hook passes `--ephemeral` to `task`.
 
-### 7. Native review follow-up, the one open question
+### 7. Native review follow-up
 
-`/cx:review` uses `review/start`. With inline delivery the review turn runs
-on the source thread, so a later `thread/resume` plus `turn/start` on that
-thread should see the findings. This is not verified. The implementation plan
-starts with a spike against the real Codex CLI:
+The goal is that a follow-up reaches the same model session that did the
+review. For adversarial reviews and tasks that is the thread the plugin
+started. For `/cx:review` it is not: Codex runs the built-in reviewer in a
+sub-agent session of its own and hands the requesting thread only the final
+write-up.
 
-1. Start a persistent thread, run `review/start` inline on it.
-2. Resume the thread and send "Elaborate on your first finding."
-3. If the answer refers to the actual finding, register `sourceThreadId`
-   for native reviews and the design stands as written.
-4. If it does not, register `reviewThreadId` instead and try the same
-   follow-up on it. If that works, use it. If neither works, native review
-   stays registered but `ask` on a `review` thread prints a one-line notice
-   that built-in reviews cannot be questioned and suggests
-   `/cx:adversarial-review --name`, which is a plain prompt turn and
-   provably resumable.
+`runAppServerReview` therefore looks the reviewer's session up after the
+review, with `thread/list` filtered to `sourceKinds: ["subAgentReview"]` and
+matched on `parentThreadId`, and returns it as `reviewerThreadId`. The
+registry records that id. The reviewer's session gets the Codex name
+`cx:<name>` and the requesting thread becomes `cx:<name> (request)`. If no
+reviewer session is reported, the requesting thread is registered instead.
 
-The spike result is recorded in the plan and in `README.md`.
+Findings and the evidence are in
+`docs/superpowers/spikes/2026-10-08-native-review-follow-up.md`.
 
 ### 8. Testing
 

@@ -2232,9 +2232,12 @@ test("runAppServerReview persists and names the thread when asked", async () => 
     });
     assert.equal(result.status, 0);
     const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-    const thread = fakeState.threads.find((t) => t.id === result.sourceThreadId);
-    assert.equal(thread.ephemeral, false);
-    assert.equal(thread.name, "cx:review-9");
+    const source = fakeState.threads.find((t) => t.id === result.sourceThreadId);
+    const reviewer = fakeState.threads.find((t) => t.id === result.reviewerThreadId);
+    assert.equal(source.ephemeral, false);
+    assert.equal(source.name, "cx:review-9 (request)");
+    assert.equal(reviewer.parentThreadId, result.sourceThreadId);
+    assert.equal(reviewer.name, "cx:review-9");
   } finally {
     process.env.PATH = previousPath;
   }
@@ -2417,22 +2420,42 @@ function seedDirtyRepo() {
   return { repo, binDir, env: buildEnv(binDir), statePath: path.join(binDir, "fake-codex-state.json") };
 }
 
-test("review registers a persistent named thread", () => {
+test("review registers the reviewer's own session, not the thread that requested it", () => {
   const { repo, env, statePath } = seedDirtyRepo();
   const result = run("node", [SCRIPT, "review", "--name", "pr-review"], { cwd: repo, env });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /No material issues found/);
-  assert.match(result.stdout, /Thread: pr-review \(thr_1\)\nFollow up: \/cx:ask pr-review <question>/);
+  assert.match(result.stdout, /Thread: pr-review \(thr_2\)\nFollow up: \/cx:ask pr-review <question>/);
 
   const registry = readRegistry(repo);
   assert.equal(registry.threads[0].name, "pr-review");
   assert.equal(registry.threads[0].kind, "review");
   assert.equal(registry.threads[0].sandbox, "read-only");
-  assert.equal(registry.threads[0].threadId, "thr_1");
+  assert.equal(registry.threads[0].threadId, "thr_2");
   assert.equal(registry.threads[0].turns, 1);
 
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  assert.equal(fakeState.threads.find((t) => t.id === "thr_1").ephemeral, false);
+  const source = fakeState.threads.find((t) => t.id === "thr_1");
+  const reviewer = fakeState.threads.find((t) => t.id === "thr_2");
+  assert.equal(source.ephemeral, false);
+  assert.equal(source.name, "cx:pr-review (request)");
+  assert.equal(reviewer.parentThreadId, "thr_1");
+  assert.equal(reviewer.name, "cx:pr-review");
+
+  const follow = run("node", [SCRIPT, "ask", "pr-review", "follow up on what you checked"], { cwd: repo, env });
+  assert.equal(follow.status, 0, follow.stderr);
+  const afterAsk = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(afterAsk.lastTurnStart.threadId, "thr_2");
+});
+
+test("review falls back to the requesting thread when Codex reports no reviewer session", () => {
+  const { repo, binDir, env, statePath } = seedDirtyRepo();
+  installFakeCodex(binDir, "review-no-reviewer-thread");
+  const result = run("node", [SCRIPT, "review", "--name", "pr-review"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Thread: pr-review \(thr_1\)/);
+  assert.equal(readRegistry(repo).threads[0].threadId, "thr_1");
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.threads.find((t) => t.id === "thr_1").name, "cx:pr-review");
 });
 
@@ -2473,9 +2496,9 @@ test("ask resumes a named thread and is read-only by default", () => {
   const result = run("node", [SCRIPT, "ask", "rev", "elaborate on the follow up"], { cwd: repo, env });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Resumed the prior run\./);
-  assert.match(result.stdout, /Thread: rev \(thr_1\)/);
+  assert.match(result.stdout, /Thread: rev \(thr_2\)/);
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_2");
   assert.equal(fakeState.lastTurnStart.prompt, "elaborate on the follow up");
   assert.equal(fakeState.lastResume.sandbox, "read-only");
 });
@@ -2536,7 +2559,7 @@ test("threads lists registered threads and forget removes one", () => {
 
   const forgotten = run("node", [SCRIPT, "forget", "rev"], { cwd: repo, env });
   assert.equal(forgotten.status, 0, forgotten.stderr);
-  assert.match(forgotten.stdout, /Forgot thread rev\.\nThe Codex conversation itself is untouched\.\nResume in Codex: codex resume thr_1/);
+  assert.match(forgotten.stdout, /Forgot thread rev\.\nThe Codex conversation itself is untouched\.\nResume in Codex: codex resume thr_2/);
   assert.deepEqual(readRegistry(repo).threads.map((t) => t.name), ["fix"]);
 
   const missing = run("node", [SCRIPT, "forget", "rev"], { cwd: repo, env });
