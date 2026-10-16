@@ -1,17 +1,16 @@
-# Codex plugin for Claude Code
+# cx: Codex threads for Claude Code
 
-Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
+Use Codex from inside Claude Code for code reviews or to delegate tasks, and keep talking to the same Codex conversation afterwards.
 
-This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
-they already have.
-
-<video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
+This is a fork of [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc). Every Codex run it starts is a named, persistent thread. You can come back to any of them later, by name, with a follow-up question or instruction, and Codex answers with its full earlier context. The plugin is named `cx` so it can be installed beside the upstream `codex` plugin.
 
 ## What You Get
 
-- `/codex:review` for a normal read-only Codex review
-- `/codex:adversarial-review` for a steerable challenge review
-- `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
+- `/cx:review` for a normal read-only Codex review
+- `/cx:adversarial-review` for a steerable challenge review
+- `/cx:rescue` to delegate a task to Codex
+- `/cx:ask` to send a follow-up to any earlier review or task, `/cx:threads` to list them, and `/cx:forget` to drop one
+- `/cx:transfer`, `/cx:status`, `/cx:result`, and `/cx:cancel` to hand off sessions and manage background jobs
 
 ## Requirements
 
@@ -24,13 +23,13 @@ they already have.
 Add the marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add openai/codex-plugin-cc
+/plugin marketplace add cannonpalms/codex-plugin-cc
 ```
 
 Install the plugin:
 
 ```bash
-/plugin install codex@openai-codex
+/plugin install cx@cx
 ```
 
 Reload plugins:
@@ -42,10 +41,10 @@ Reload plugins:
 Then run:
 
 ```bash
-/codex:setup
+/cx:setup
 ```
 
-`/codex:setup` will tell you whether Codex is ready. If Codex is missing and npm is available, it can offer to install Codex for you.
+`/cx:setup` will tell you whether Codex is ready. If Codex is missing and npm is available, it can offer to install Codex for you.
 
 If you prefer to install Codex yourself, use:
 
@@ -62,19 +61,47 @@ If Codex is installed but not logged in yet, run:
 After install, you should see:
 
 - the slash commands listed below
-- the `codex:codex-rescue` subagent in `/agents`
+- the `cx:codex-rescue` subagent in `/agents`
 
 One simple first run is:
 
 ```bash
-/codex:review --background
-/codex:status
-/codex:result
+/cx:review --background
+/cx:status
+/cx:result
 ```
+
+## Threads
+
+Every review, adversarial review and rescue runs on its own Codex thread. The plugin records each thread by name, per repository, so a thread started in one Claude Code session is still there in the next.
+
+- Pass `--name <thread>` to choose the name. Names are lowercase letters, digits, `.`, `_` and `-`.
+- Without `--name` the plugin picks `review-N`, `adv-N` or `task-N`.
+- Each result ends with the thread name and a ready-made follow-up command:
+
+```text
+Thread: pr-412 (01a11c22-078d-7693-aeb0-4881b876131f)
+Follow up: /cx:ask pr-412 <question>
+Resume in Codex: codex resume 01a11c22-078d-7693-aeb0-4881b876131f
+```
+
+A typical exchange:
+
+```bash
+/cx:review --name pr-412 --base main
+/cx:ask pr-412 elaborate on the race you flagged in the cache layer
+/cx:threads
+```
+
+You can also say it in plain words. "Ask that reviewer to elaborate on the second finding" finds the most recent review thread and sends the question to it.
+
+Several threads can run at once. A single thread takes one turn at a time, so `/cx:ask` on a thread that is still working reports the job that holds it.
+
+Each follow-up re-sends the thread's history to Codex, so a very long-lived thread costs more per question. Start a fresh one when the topic changes.
 
 ## Usage
 
-### `/codex:review`
+### `/cx:review`
 
 Runs a normal Codex review on your current work. It gives you the same quality of code review as running `/review` inside Codex directly.
 
@@ -86,26 +113,26 @@ Use it when you want:
 - a review of your current uncommitted changes
 - a review of your branch compared to a base branch like `main`
 
-Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
+Use `--base <ref>` for branch review. It also supports `--wait`, `--background` and `--name <thread>`. The review itself does not take custom focus text, but you can question it afterwards with [`/cx:ask`](#cxask). Use [`/cx:adversarial-review`](#cxadversarial-review) when you want to challenge a specific decision or risk area.
 
 Examples:
 
 ```bash
-/codex:review
-/codex:review --base main
-/codex:review --background
+/cx:review
+/cx:review --base main
+/cx:review --background
 ```
 
-This command is read-only and will not perform any changes. When run in the background you can use [`/codex:status`](#codexstatus) to check on the progress and [`/codex:cancel`](#codexcancel) to cancel the ongoing task.
+This command is read-only and will not perform any changes. When run in the background you can use [`/cx:status`](#cxstatus) to check on the progress and [`/cx:cancel`](#cxcancel) to cancel the ongoing task.
 
-### `/codex:adversarial-review`
+### `/cx:adversarial-review`
 
 Runs a **steerable** review that questions the chosen implementation and design.
 
 It can be used to pressure-test assumptions, tradeoffs, failure modes, and whether a different approach would have been safer or simpler.
 
-It uses the same review target selection as `/codex:review`, including `--base <ref>` for branch review.
-It also supports `--wait` and `--background`. Unlike `/codex:review`, it can take extra focus text after the flags.
+It uses the same review target selection as `/cx:review`, including `--base <ref>` for branch review.
+It also supports `--wait` and `--background`. Unlike `/cx:review`, it can take extra focus text after the flags.
 
 Use it when you want:
 
@@ -116,16 +143,16 @@ Use it when you want:
 Examples:
 
 ```bash
-/codex:adversarial-review
-/codex:adversarial-review --base main challenge whether this was the right caching and retry design
-/codex:adversarial-review --background look for race conditions and question the chosen approach
+/cx:adversarial-review
+/cx:adversarial-review --base main challenge whether this was the right caching and retry design
+/cx:adversarial-review --background look for race conditions and question the chosen approach
 ```
 
 This command is read-only. It does not fix code.
 
-### `/codex:rescue`
+### `/cx:rescue`
 
-Hands a task to Codex through the `codex:codex-rescue` subagent.
+Hands a task to Codex through the `cx:codex-rescue` subagent.
 
 Use it when you want Codex to:
 
@@ -137,17 +164,19 @@ Use it when you want Codex to:
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--resume`, `--fresh`, `--name <thread>` and `--thread <ref>`. If you omit all of the thread flags, the plugin can offer to continue the latest rescue thread for this repo, naming it and saying how old it is. `--name` starts a new thread with that name. `--thread` continues a specific one.
 
 Examples:
 
 ```bash
-/codex:rescue investigate why the tests started failing
-/codex:rescue fix the failing test with the smallest safe patch
-/codex:rescue --resume apply the top fix from the last run
-/codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
-/codex:rescue --model spark fix the issue quickly
-/codex:rescue --background investigate the regression
+/cx:rescue investigate why the tests started failing
+/cx:rescue fix the failing test with the smallest safe patch
+/cx:rescue --resume apply the top fix from the last run
+/cx:rescue --name auth-fix investigate the login redirect loop
+/cx:rescue --thread auth-fix now write a regression test for it
+/cx:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
+/cx:rescue --model spark fix the issue quickly
+/cx:rescue --background investigate the regression
 ```
 
 You can also just ask for a task to be delegated to Codex:
@@ -160,9 +189,35 @@ Ask Codex to redesign the database connection to be more resilient.
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
-- follow-up rescue requests can continue the latest Codex task in the repo
+- follow-up rescue requests can continue the latest Codex task in the repo, including one from an earlier Claude Code session
 
-### `/codex:transfer`
+### `/cx:ask`
+
+Sends a follow-up question or instruction to a named thread.
+
+```bash
+/cx:ask review-2 what did you mean by the second finding?
+/cx:ask adv-1 --background re-check that concern against the new commit
+/cx:ask auth-fix --write apply the fix you proposed
+```
+
+The thread keeps the sandbox it started with, so a reviewer stays read-only. Pass `--write` to let Codex edit files on that turn. It supports `--wait` and `--background` and runs in the foreground by default.
+
+The thread reference is its name or a unique prefix of its Codex session ID.
+
+### `/cx:threads`
+
+Lists the threads recorded for this repository with their kind, whether they are idle or busy, how many turns they have had, and the last prompt.
+
+### `/cx:forget`
+
+Removes a thread from the list. The Codex conversation itself is kept, and the command prints the `codex resume` command for it.
+
+```bash
+/cx:forget review-2
+```
+
+### `/cx:transfer`
 
 Creates a persistent Codex thread from the current Claude Code session and prints a `codex resume <session-id>` command.
 
@@ -171,21 +226,21 @@ Use it when you started a debugging or implementation conversation in Claude Cod
 Examples:
 
 ```bash
-/codex:transfer
-/codex:transfer --source ~/.claude/projects/-Users-me-repo/<session-id>.jsonl
+/cx:transfer
+/cx:transfer --source ~/.claude/projects/-Users-me-repo/<session-id>.jsonl
 ```
 
 The plugin's existing `SessionStart` hook supplies the current transcript path automatically; `--source` is available as a manual override. The transfer uses Codex's external-agent session importer, so it follows the same conversion rules as importing Claude history in the Codex App and creates visible turns that can be continued in the App or TUI. The source must be under `~/.claude/projects`, and older Codex versions that do not expose session import must be upgraded before using this command.
 
-### `/codex:status`
+### `/cx:status`
 
 Shows running and recent Codex jobs for the current repository.
 
 Examples:
 
 ```bash
-/codex:status
-/codex:status task-abc123
+/cx:status
+/cx:status task-abc123
 ```
 
 Use it to:
@@ -194,7 +249,7 @@ Use it to:
 - see the latest completed job
 - confirm whether a task is still running
 
-### `/codex:result`
+### `/cx:result`
 
 Shows the final stored Codex output for a finished job.
 When available, it also includes the Codex session ID so you can reopen that run directly in Codex with `codex resume <session-id>`.
@@ -202,33 +257,33 @@ When available, it also includes the Codex session ID so you can reopen that run
 Examples:
 
 ```bash
-/codex:result
-/codex:result task-abc123
+/cx:result
+/cx:result task-abc123
 ```
 
-### `/codex:cancel`
+### `/cx:cancel`
 
 Cancels an active background Codex job.
 
 Examples:
 
 ```bash
-/codex:cancel
-/codex:cancel task-abc123
+/cx:cancel
+/cx:cancel task-abc123
 ```
 
-### `/codex:setup`
+### `/cx:setup`
 
 Checks whether Codex is installed and authenticated.
 If Codex is missing and npm is available, it can offer to install Codex for you.
 
-You can also use `/codex:setup` to manage the optional review gate.
+You can also use `/cx:setup` to manage the optional review gate.
 
 #### Enabling review gate
 
 ```bash
-/codex:setup --enable-review-gate
-/codex:setup --disable-review-gate
+/cx:setup --enable-review-gate
+/cx:setup --disable-review-gate
 ```
 
 When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted Codex review based on Claude's response. If that review finds issues, the stop is blocked so Claude can address them first.
@@ -241,27 +296,27 @@ When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted
 ### Review Before Shipping
 
 ```bash
-/codex:review
+/cx:review
 ```
 
 ### Hand A Problem To Codex
 
 ```bash
-/codex:rescue investigate why the build is failing in CI
+/cx:rescue investigate why the build is failing in CI
 ```
 
 ### Start Something Long-Running
 
 ```bash
-/codex:adversarial-review --background
-/codex:rescue --background investigate the flaky test
+/cx:adversarial-review --background
+/cx:rescue --background investigate the flaky test
 ```
 
 Then check in with:
 
 ```bash
-/codex:status
-/codex:result
+/cx:status
+/cx:result
 ```
 
 ## Codex Integration
@@ -287,9 +342,25 @@ Check out the Codex docs for more [configuration options](https://developers.ope
 
 ### Moving The Work Over To Codex
 
-Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
+Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/cx:result` or `/cx:status` or by selecting it from the list.
 
 This way you can review the Codex work or continue the work there.
+
+### Following Up On A Built-In Review
+
+`/cx:review` uses Codex's built-in reviewer, which Codex runs in a session of its own. The thread that asked for the review only receives the final write-up. The plugin therefore records the reviewer's session, so `/cx:ask` reaches the model that read the diffs and ran the commands. Asked afterwards what it had run, the reviewer listed its shell commands and the files it read from memory.
+
+Codex CLI 0.161.0 does not announce the reviewer's session. The plugin finds it by listing review sub-agent threads and matching the parent. If a Codex release stops reporting it, the plugin falls back to the requesting thread, where follow-ups can discuss the findings as written but not how they were reached. The checks are written up in `docs/superpowers/spikes/2026-10-08-native-review-follow-up.md`.
+
+## Merging Upstream
+
+```bash
+git fetch upstream
+git merge upstream/main
+npm test
+```
+
+Expect conflicts in `plugins/codex/commands/*.md` and `README.md` from the `/cx:` rename. Keep the `cx` side. The plugin directory is still `plugins/codex` so other files merge cleanly.
 
 ## FAQ
 
@@ -297,7 +368,7 @@ This way you can review the Codex work or continue the work there.
 
 If you are already signed into Codex on this machine, that account should work immediately here too. This plugin uses your local Codex CLI authentication.
 
-If you only use Claude Code today and have not used Codex yet, you will also need to sign in to Codex with either a ChatGPT account or an API key. [Codex is available with your ChatGPT subscription](https://developers.openai.com/codex/pricing/), and [`codex login`](https://developers.openai.com/codex/cli/reference/#codex-login) supports both ChatGPT and API key sign-in. Run `/codex:setup` to check whether Codex is ready, and use `!codex login` if it is not.
+If you only use Claude Code today and have not used Codex yet, you will also need to sign in to Codex with either a ChatGPT account or an API key. [Codex is available with your ChatGPT subscription](https://developers.openai.com/codex/pricing/), and [`codex login`](https://developers.openai.com/codex/cli/reference/#codex-login) supports both ChatGPT and API key sign-in. Run `/cx:setup` to check whether Codex is ready, and use `!codex login` if it is not.
 
 ### Does the plugin use a separate Codex runtime?
 

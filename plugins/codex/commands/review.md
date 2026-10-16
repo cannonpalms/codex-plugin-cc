@@ -1,6 +1,6 @@
 ---
 description: Run a Codex code review against local git state
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]'
+argument-hint: '[--wait|--background] [--name <thread>] [--base <ref>] [--scope auto|working-tree|branch]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -32,12 +32,13 @@ Execution mode rules:
   - `Run in background`
 
 Argument handling:
+- `--name <thread>` names the Codex thread so the user can continue it later with `/cx:ask <thread> <question>`. Pass it through unchanged. Without it the plugin picks `review-N`.
 - Preserve the user's arguments exactly.
 - Do not strip `--wait` or `--background` yourself.
 - Do not add extra review instructions or rewrite the user's intent.
 - The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
-- `/codex:review` is native-review only. It does not support staged-only review, unstaged-only review, or extra focus text.
-- If the user needs custom review instructions or more adversarial framing, they should use `/codex:adversarial-review`.
+- `/cx:review` is native-review only. It does not support staged-only review, unstaged-only review, or extra focus text.
+- If the user needs custom review instructions or more adversarial framing, they should use `/cx:adversarial-review`.
 
 Foreground flow:
 - Run:
@@ -45,6 +46,7 @@ Foreground flow:
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review "$ARGUMENTS"
 ```
 - Return the command stdout verbatim, exactly as-is.
+- The output ends with a `Thread:` line and a `Follow up:` hint. Leave them in place; they are how the user continues the review.
 - Do not paraphrase, summarize, or add commentary before or after it.
 - Do not fix any issues mentioned in the review output.
 
@@ -58,4 +60,4 @@ Bash({
 })
 ```
 - Do not call `BashOutput` or wait for completion in this turn.
-- After launching the command, tell the user: "Codex review started in the background. Check `/codex:status` for progress."
+- After launching the command, tell the user: "Codex review started in the background. Check `/cx:status` for progress."

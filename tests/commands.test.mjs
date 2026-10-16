@@ -64,7 +64,7 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /Claude Code's `Bash\(..., run_in_background: true\)` is what actually detaches the run/i);
   assert.match(source, /When in doubt, run the review/i);
   assert.match(source, /\(Recommended\)/);
-  assert.match(source, /uses the same review target selection as `\/codex:review`/i);
+  assert.match(source, /uses the same review target selection as `\/cx:review`/i);
   assert.match(source, /supports working-tree review, branch review, and `--base <ref>`/i);
   assert.match(source, /does not support `--scope staged` or `--scope unstaged`/i);
   assert.match(source, /can still take extra focus text after the flags/i);
@@ -74,12 +74,15 @@ test("continue is not exposed as a user-facing command", () => {
   const commandFiles = fs.readdirSync(path.join(PLUGIN_ROOT, "commands")).sort();
   assert.deepEqual(commandFiles, [
     "adversarial-review.md",
+    "ask.md",
     "cancel.md",
+    "forget.md",
     "rescue.md",
     "result.md",
     "review.md",
     "setup.md",
     "status.md",
+    "threads.md",
     "transfer.md"
   ]);
 });
@@ -94,12 +97,12 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /allowed-tools:\s*Bash\(node:\*\),\s*AskUserQuestion,\s*Agent/);
   // Regression for #234: `Skill(codex:rescue)` from the main agent recursed
   // because rescue.md named the routing with ambiguous prose ("Route this
-  // request to the `codex:codex-rescue` subagent") while running under
+  // request to the `cx:codex-rescue` subagent") while running under
   // `context: fork` — forked general-purpose subagents do not expose the
   // `Agent` tool, so the fork fell back to `Skill` and re-entered this
   // command. Pin the explicit transport and the inline (no-fork) execution.
-  assert.match(rescue, /subagent_type: "codex:codex-rescue"/);
-  assert.match(rescue, /do not call `Skill\(codex:codex-rescue\)`/i);
+  assert.match(rescue, /subagent_type: "cx:codex-rescue"/);
+  assert.match(rescue, /do not call `Skill\(cx:codex-rescue\)`/i);
   assert.doesNotMatch(rescue, /^context:\s*fork\b/m);
   assert.match(rescue, /--background\|--wait/);
   assert.match(rescue, /--resume\|--fresh/);
@@ -107,9 +110,9 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /--effort <none\|minimal\|low\|medium\|high\|xhigh>/);
   assert.match(rescue, /task-resume-candidate --json/);
   assert.match(rescue, /AskUserQuestion/);
-  assert.match(rescue, /Continue current Codex thread/);
+  assert.match(rescue, /Continue thread <candidate\.name>/);
   assert.match(rescue, /Start a new Codex thread/);
-  assert.match(rescue, /run the `codex:codex-rescue` subagent in the background/i);
+  assert.match(rescue, /run the `cx:codex-rescue` subagent in the background/i);
   assert.match(rescue, /default to foreground/i);
   assert.match(rescue, /Do not forward them to `task`/i);
   assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
@@ -153,21 +156,21 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
-  assert.match(readme, /`codex:codex-rescue` subagent/i);
+  assert.match(readme, /`cx:codex-rescue` subagent/i);
   assert.match(readme, /if you do not pass `--model` or `--effort`, Codex chooses its own defaults/i);
   assert.match(readme, /--model gpt-5\.4-mini --effort medium/i);
   assert.match(readme, /`spark`, the plugin maps that to `gpt-5\.3-codex-spark`/i);
   assert.match(readme, /continue a previous Codex task/i);
-  assert.match(readme, /### `\/codex:setup`/);
-  assert.match(readme, /### `\/codex:review`/);
-  assert.match(readme, /### `\/codex:adversarial-review`/);
-  assert.match(readme, /uses the same review target selection as `\/codex:review`/i);
+  assert.match(readme, /### `\/cx:setup`/);
+  assert.match(readme, /### `\/cx:review`/);
+  assert.match(readme, /### `\/cx:adversarial-review`/);
+  assert.match(readme, /uses the same review target selection as `\/cx:review`/i);
   assert.match(readme, /--base main challenge whether this was the right caching and retry design/);
-  assert.match(readme, /### `\/codex:rescue`/);
-  assert.match(readme, /### `\/codex:transfer`/);
-  assert.match(readme, /### `\/codex:status`/);
-  assert.match(readme, /### `\/codex:result`/);
-  assert.match(readme, /### `\/codex:cancel`/);
+  assert.match(readme, /### `\/cx:rescue`/);
+  assert.match(readme, /### `\/cx:transfer`/);
+  assert.match(readme, /### `\/cx:status`/);
+  assert.match(readme, /### `\/cx:result`/);
+  assert.match(readme, /### `\/cx:cancel`/);
 });
 
 test("transfer, result, and cancel commands are exposed as deterministic runtime entrypoints", () => {
@@ -220,6 +223,97 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(setup, /codex-companion\.mjs" setup --json \$ARGUMENTS/);
   assert.match(readme, /!codex login/);
   assert.match(readme, /offer to install Codex for you/i);
-  assert.match(readme, /\/codex:setup --enable-review-gate/);
-  assert.match(readme, /\/codex:setup --disable-review-gate/);
+  assert.match(readme, /\/cx:setup --enable-review-gate/);
+  assert.match(readme, /\/cx:setup --disable-review-gate/);
+});
+
+function walk(dir) {
+  const out = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === "node_modules" || entry.name === ".generated") continue;
+      out.push(...walk(full));
+    } else {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
+test("no plugin file still uses the upstream codex prefix", () => {
+  const files = [...walk(PLUGIN_ROOT), path.join(ROOT, "README.md")];
+  const offenders = files.filter((file) => {
+    const text = fs.readFileSync(file, "utf8");
+    return /\/codex:/.test(text) || /codex:codex-rescue/.test(text);
+  });
+  assert.deepEqual(offenders.map((file) => path.relative(ROOT, file)), []);
+});
+
+test("plugin and marketplace manifests are named cx", () => {
+  const plugin = JSON.parse(read(".claude-plugin/plugin.json"));
+  assert.equal(plugin.name, "cx");
+  const marketplace = JSON.parse(fs.readFileSync(path.join(ROOT, ".claude-plugin", "marketplace.json"), "utf8"));
+  assert.equal(marketplace.name, "cx");
+  assert.equal(marketplace.plugins[0].name, "cx");
+  assert.equal(marketplace.plugins[0].source, "./plugins/codex");
+});
+
+test("ask command forwards to the ask subcommand verbatim and never fixes code", () => {
+  const source = read("commands/ask.md");
+  assert.match(source, /argument-hint: '<thread> \[--wait\|--background\] \[--write\] <question>'/);
+  assert.match(source, /disable-model-invocation: true/);
+  assert.match(source, /codex-companion\.mjs" ask "\$ARGUMENTS"/);
+  assert.match(source, /run_in_background:\s*true/);
+  assert.match(source, /Return the command stdout verbatim/i);
+  assert.match(source, /Do not fix issues/i);
+  assert.match(source, /\/cx:threads/);
+});
+
+test("threads and forget commands are inline bang commands", () => {
+  const threads = read("commands/threads.md");
+  assert.match(threads, /!`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" threads "\$ARGUMENTS"`/);
+  assert.match(threads, /disable-model-invocation: true/);
+  const forget = read("commands/forget.md");
+  assert.match(forget, /!`node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/codex-companion\.mjs" forget "\$ARGUMENTS"`/);
+  assert.match(forget, /argument-hint: '<thread>'/);
+});
+
+test("review commands document --name and the follow-up hint", () => {
+  for (const file of ["commands/review.md", "commands/adversarial-review.md"]) {
+    const source = read(file);
+    assert.match(source, /\[--name <thread>\]/, file);
+    assert.match(source, /\/cx:ask/, file);
+  }
+});
+
+test("rescue command asks about the named candidate thread and forwards --thread", () => {
+  const source = read("commands/rescue.md");
+  assert.match(source, /task-resume-candidate --json/);
+  assert.match(source, /candidate\.name/);
+  assert.match(source, /ageLabel/);
+  assert.match(source, /--thread <ref>/);
+  assert.match(source, /--name <thread>/);
+});
+
+test("rescue agent and runtime skill pass --name and --thread through to task", () => {
+  const agent = read("agents/codex-rescue.md");
+  assert.match(agent, /--thread/);
+  assert.match(agent, /--name/);
+  assert.match(agent, /`--resume` means add `--resume-last`/);
+  const runtime = read("skills/codex-cli-runtime/SKILL.md");
+  assert.match(runtime, /task --thread <ref>/);
+  assert.match(runtime, /task --name <thread>/);
+});
+
+test("follow-up skill maps natural language to ask", () => {
+  const source = read("skills/cx-follow-up/SKILL.md");
+  assert.match(source, /^name: cx-follow-up$/m);
+  assert.match(source, /ask that reviewer/i);
+  assert.match(source, /threads --json/);
+  assert.match(source, /codex-companion\.mjs" ask/);
+  assert.match(source, /verbatim/i);
+  assert.match(source, /AskUserQuestion/);
+  assert.match(source, /Never answer on Codex's behalf/i);
+  assert.doesNotMatch(source, /user-invocable: false/);
 });

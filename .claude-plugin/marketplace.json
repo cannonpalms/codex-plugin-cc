@@ -1,17 +1,17 @@
 {
-  "name": "openai-codex",
+  "name": "cx",
   "owner": {
-    "name": "OpenAI"
+    "name": "Cannon Palms"
   },
   "metadata": {
-    "description": "Codex plugins to use in Claude Code for delegation and code review.",
-    "version": "1.0.6"
+    "description": "Codex plugin for Claude Code with named, resumable threads.",
+    "version": "1.1.0"
   },
   "plugins": [
     {
-      "name": "codex",
-      "description": "Use Codex from Claude Code to review code or delegate tasks.",
-      "version": "1.0.6",
+      "name": "cx",
+      "description": "Use Codex from Claude Code with named, resumable threads: review, delegate, then ask follow-ups.",
+      "version": "1.1.0",
       "author": {
         "name": "OpenAI"
       },

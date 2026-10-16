@@ -35,6 +35,9 @@ Forwarding rules:
 - Treat `--resume` and `--fresh` as routing controls and do not include them in the task text you pass through.
 - `--resume` means add `--resume-last`.
 - `--fresh` means do not add `--resume-last`.
+- `--thread <ref>` means add `--thread <ref>` to the `task` call and strip it from the task text.
+- `--name <thread>` means add `--name <thread>` to the `task` call and strip it from the task text.
+- If the user names a thread in words ("the auth thread", "that reviewer"), do not guess. Forward without `--thread`; the main thread resolves names through the `cx-follow-up` skill.
 - If the user is clearly asking to continue prior Codex work in this repository, such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", add `--resume-last` unless `--fresh` is present.
 - Otherwise forward the task as a fresh `task` run.
 - Preserve the user's task text as-is apart from stripping routing flags.

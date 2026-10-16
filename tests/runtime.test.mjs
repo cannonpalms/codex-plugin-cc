@@ -28,6 +28,14 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   throw new Error("Timed out waiting for condition.");
 }
 
+function assertTaskOutput(stdout, body) {
+  assert.ok(stdout.startsWith(body), stdout);
+  assert.match(
+    stdout.slice(body.length),
+    /^\nThread: task-\d+ \((thr_\d+)\)\nFollow up: \/cx:ask task-\d+ <question>\nResume in Codex: codex resume \1\n$/
+  );
+}
+
 test("setup reports ready when fake codex is installed and authenticated", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -211,7 +219,7 @@ test("transfer delegates the current Claude session directly to native import", 
       { type: "custom-title", customTitle: "Native transfer" },
       { type: "user", cwd: repo, message: { role: "user", content: "Initial request" } },
       { type: "assistant", cwd: repo, message: { role: "assistant", content: "Initial answer" } },
-      { type: "user", cwd: repo, message: { role: "user", content: "/codex:transfer" } }
+      { type: "user", cwd: repo, message: { role: "user", content: "/cx:transfer" } }
     ].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
     "utf8"
   );
@@ -240,7 +248,7 @@ test("transfer delegates the current Claude session directly to native import", 
   assert.equal(fakeState.lastExternalAgentImport.sourcePath, canonicalSourcePath);
   assert.deepEqual(
     fakeState.threads[0].visibleMessages.map((message) => message.text),
-    ["Initial request", "Initial answer", "/codex:transfer"]
+    ["Initial request", "Initial answer", "/cx:transfer"]
   );
 });
 
@@ -500,77 +508,43 @@ test("task --resume-last resumes the latest persisted task thread", () => {
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
+  assertTaskOutput(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
 });
 
-test("task-resume-candidate returns the latest rescue thread from the current session", () => {
+test("task-resume-candidate returns the latest idle task thread across sessions", () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
-  const jobsDir = path.join(stateDir, "jobs");
-  fs.mkdirSync(jobsDir, { recursive: true });
-
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
   fs.writeFileSync(
-    path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-current",
-            status: "completed",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-current",
-            threadId: "thr_current",
-            summary: "Investigate the flaky test",
-            updatedAt: "2026-03-24T20:00:00.000Z"
-          },
-          {
-            id: "task-other-session",
-            status: "completed",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-other",
-            threadId: "thr_other",
-            summary: "Old rescue run",
-            updatedAt: "2026-03-24T20:05:00.000Z"
-          },
-          {
-            id: "review-current",
-            status: "completed",
-            title: "Codex Review",
-            jobClass: "review",
-            sessionId: "sess-current",
-            threadId: "thr_review",
-            summary: "Review main...HEAD",
-            updatedAt: "2026-03-24T20:10:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
+    path.join(stateDir, "threads.json"),
+    `${JSON.stringify({
+      version: 1,
+      counters: { task: 2, review: 1 },
+      threads: [
+        { name: "review-1", threadId: "thr_review", kind: "review", sandbox: "read-only", model: null, createdAt: "2026-03-24T20:10:00.000Z", updatedAt: "2026-03-24T20:10:00.000Z", createdBySession: "sess-current", lastPrompt: "Review main...HEAD", lastJobId: "review-current", turns: 1, activeJobId: null },
+        { name: "task-2", threadId: "thr_other", kind: "task", sandbox: "read-only", model: null, createdAt: "2026-03-24T20:05:00.000Z", updatedAt: "2026-03-24T20:05:00.000Z", createdBySession: "sess-other", lastPrompt: "Old rescue run", lastJobId: "task-other-session", turns: 1, activeJobId: null },
+        { name: "task-1", threadId: "thr_current", kind: "task", sandbox: "read-only", model: null, createdAt: "2026-03-24T20:00:00.000Z", updatedAt: "2026-03-24T20:00:00.000Z", createdBySession: "sess-current", lastPrompt: "Investigate the flaky test", lastJobId: "task-current", turns: 1, activeJobId: null }
+      ]
+    }, null, 2)}\n`,
     "utf8"
   );
 
   const result = run("node", [SCRIPT, "task-resume-candidate", "--json"], {
     cwd: workspace,
-    env: {
-      ...process.env,
-      CODEX_COMPANION_SESSION_ID: "sess-current"
-    }
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-current" }
   });
 
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.available, true);
   assert.equal(payload.sessionId, "sess-current");
-  assert.equal(payload.candidate.id, "task-current");
-  assert.equal(payload.candidate.threadId, "thr_current");
+  assert.equal(payload.candidate.name, "task-2");
+  assert.equal(payload.candidate.threadId, "thr_other");
+  assert.equal(payload.candidate.lastPrompt, "Old rescue run");
+  assert.match(payload.candidate.ageLabel, /ago$/);
 });
 
-test("task --resume-last does not resume a task from another Claude session", () => {
+test("task --resume-last resumes a finished task thread from another Claude session", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const statePath = path.join(binDir, "fake-codex-state.json");
@@ -580,41 +554,32 @@ test("task --resume-last does not resume a task from another Claude session", ()
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const otherEnv = {
-    ...buildEnv(binDir),
-    CODEX_COMPANION_SESSION_ID: "sess-other"
-  };
-  const currentEnv = {
-    ...buildEnv(binDir),
-    CODEX_COMPANION_SESSION_ID: "sess-current"
-  };
+  const otherEnv = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-other" };
+  const currentEnv = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-current" };
 
-  const firstRun = run("node", [SCRIPT, "task", "initial task"], {
-    cwd: repo,
-    env: otherEnv
-  });
+  const firstRun = run("node", [SCRIPT, "task", "initial task"], { cwd: repo, env: otherEnv });
   assert.equal(firstRun.status, 0, firstRun.stderr);
 
-  const candidate = run("node", [SCRIPT, "task-resume-candidate", "--json"], {
-    cwd: repo,
-    env: currentEnv
-  });
+  const candidate = run("node", [SCRIPT, "task-resume-candidate", "--json"], { cwd: repo, env: currentEnv });
   assert.equal(candidate.status, 0, candidate.stderr);
-  assert.equal(JSON.parse(candidate.stdout).available, false);
+  const candidatePayload = JSON.parse(candidate.stdout);
+  assert.equal(candidatePayload.available, true);
+  assert.equal(candidatePayload.candidate.name, "task-1");
+  assert.equal(candidatePayload.candidate.threadId, "thr_1");
+  assert.equal(candidatePayload.candidate.lastPrompt, "initial task");
+  assert.equal(candidatePayload.candidate.ageLabel, "just now");
 
-  const resume = run("node", [SCRIPT, "task", "--resume-last", "follow up"], {
-    cwd: repo,
-    env: currentEnv
-  });
-  assert.equal(resume.status, 1);
-  assert.match(resume.stderr, /No previous Codex task thread was found for this repository\./);
+  const resume = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env: currentEnv });
+  assert.equal(resume.status, 0, resume.stderr);
+  assert.match(resume.stdout, /Resumed the prior run\./);
+  assert.match(resume.stdout, /Thread: task-1 \(thr_1\)/);
 
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
-  assert.equal(fakeState.lastTurnStart.prompt, "initial task");
+  assert.equal(fakeState.lastTurnStart.prompt, "follow up");
 });
 
-test("task --resume-last ignores running tasks from other Claude sessions", () => {
+test("task --resume-last refuses a task thread that is busy in another Claude session", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -627,46 +592,35 @@ test("task --resume-last ignores running tasks from other Claude sessions", () =
   fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
   fs.writeFileSync(
     path.join(stateDir, "state.json"),
-    `${JSON.stringify(
-      {
-        version: 1,
-        config: { stopReviewGate: false },
-        jobs: [
-          {
-            id: "task-other-running",
-            status: "running",
-            title: "Codex Task",
-            jobClass: "task",
-            sessionId: "sess-other",
-            threadId: "thr_other",
-            summary: "Other session active task",
-            updatedAt: "2026-03-24T20:05:00.000Z"
-          }
-        ]
-      },
-      null,
-      2
-    )}\n`,
+    `${JSON.stringify({
+      version: 1,
+      config: { stopReviewGate: false },
+      jobs: [
+        { id: "task-other-running", status: "running", title: "Codex Task", jobClass: "task", sessionId: "sess-other", threadId: "thr_other", summary: "Other session active task", updatedAt: "2026-03-24T20:05:00.000Z" }
+      ]
+    }, null, 2)}\n`,
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "threads.json"),
+    `${JSON.stringify({
+      version: 1,
+      counters: { task: 1 },
+      threads: [
+        { name: "task-1", threadId: "thr_other", kind: "task", sandbox: "read-only", model: null, createdAt: "2026-03-24T20:00:00.000Z", updatedAt: "2026-03-24T20:05:00.000Z", createdBySession: "sess-other", lastPrompt: "Other session active task", lastJobId: "task-other-running", turns: 0, activeJobId: "task-other-running" }
+      ]
+    }, null, 2)}\n`,
     "utf8"
   );
 
-  const env = {
-    ...buildEnv(binDir),
-    CODEX_COMPANION_SESSION_ID: "sess-current"
-  };
-  const status = run("node", [SCRIPT, "status", "--json"], {
-    cwd: repo,
-    env
-  });
-  assert.equal(status.status, 0, status.stderr);
-  assert.deepEqual(JSON.parse(status.stdout).running, []);
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-current" };
+  const candidate = run("node", [SCRIPT, "task-resume-candidate", "--json"], { cwd: repo, env });
+  assert.equal(candidate.status, 0, candidate.stderr);
+  assert.equal(JSON.parse(candidate.stdout).available, false);
 
-  const resume = run("node", [SCRIPT, "task", "--resume-last", "follow up"], {
-    cwd: repo,
-    env
-  });
+  const resume = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env });
   assert.equal(resume.status, 1);
-  assert.match(resume.stderr, /No previous Codex task thread was found for this repository\./);
+  assert.match(resume.stderr, /Thread "task-1" is busy with job task-other-running/);
 });
 
 test("session start hook exports the Claude session id, transcript path, and plugin data dir", () => {
@@ -713,7 +667,7 @@ test("write task output focuses on the Codex result without generic follow-up hi
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assertTaskOutput(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {
@@ -851,7 +805,7 @@ test("task waits for the main thread to complete before returning the final resu
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assertTaskOutput(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
 test("task ignores later subagent messages when choosing the final returned output", () => {
@@ -869,7 +823,7 @@ test("task ignores later subagent messages when choosing the final returned outp
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assertTaskOutput(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
 test("task can finish after subagent work even if the parent turn/completed event is missing", () => {
@@ -887,7 +841,7 @@ test("task can finish after subagent work even if the parent turn/completed even
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assertTaskOutput(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
 test("task using the shared broker still completes when Codex spawns subagents", () => {
@@ -917,7 +871,7 @@ test("task using the shared broker still completes when Codex spawns subagents",
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assertTaskOutput(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
 test("task --background enqueues a detached worker and exposes per-job status", async () => {
@@ -986,7 +940,7 @@ test("review rejects focus text because it is native-review only", () => {
 
   assert.equal(result.status > 0, true);
   assert.match(result.stderr, /does not support custom focus text/i);
-  assert.match(result.stderr, /\/codex:adversarial-review focus on auth/i);
+  assert.match(result.stderr, /\/cx:adversarial-review focus on auth/i);
 });
 
 test("review rejects staged-only scope because it is native-review only", () => {
@@ -1143,9 +1097,9 @@ test("status shows phases, hints, and the latest finished job", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Active jobs:/);
-  assert.match(result.stdout, /\| Job \| Kind \| Status \| Phase \| Elapsed \| Codex Session ID \| Summary \| Actions \|/);
-  assert.match(result.stdout, /\| review-live \| review \| running \| reviewing \| .* \| thr_1 \| Review working tree diff \|/);
-  assert.match(result.stdout, /`\/codex:status review-live`<br>`\/codex:cancel review-live`/);
+  assert.match(result.stdout, /\| Job \| Kind \| Status \| Phase \| Elapsed \| Thread \| Codex Session ID \| Summary \| Actions \|/);
+  assert.match(result.stdout, /\| review-live \| review \| running \| reviewing \| .* \|  \| thr_1 \| Review working tree diff \|/);
+  assert.match(result.stdout, /`\/cx:status review-live`<br>`\/cx:cancel review-live`/);
   assert.match(result.stdout, /Live details:/);
   assert.match(result.stdout, /Latest finished:/);
   assert.match(result.stdout, /Progress:/);
@@ -1535,7 +1489,8 @@ test("result for a finished write-capable task returns the raw Codex final respo
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /^Handled the requested task\.\nTask prompt accepted\.\n/);
-  assert.match(result.stdout, /Codex session ID: thr_[a-z0-9]+/i);
+  assert.match(result.stdout, /Thread: task-1 \(thr_[a-z0-9]+\)/i);
+  assert.match(result.stdout, /Follow up: \/cx:ask task-1 <question>/);
   assert.match(result.stdout, /Resume in Codex: codex resume thr_[a-z0-9]+/i);
 });
 
@@ -2032,8 +1987,8 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
   assert.equal(blocked.status, 0, blocked.stderr);
   assert.equal(blocked.stdout.trim(), "");
   assert.match(blocked.stderr, /Codex task task-live is still running/i);
-  assert.match(blocked.stderr, /\/codex:status/i);
-  assert.match(blocked.stderr, /\/codex:cancel task-live/i);
+  assert.match(blocked.stderr, /\/cx:status/i);
+  assert.match(blocked.stderr, /\/cx:cancel task-live/i);
 });
 
 test("stop hook allows the stop when the review gate is enabled and the stop-time review task is clean", () => {
@@ -2085,7 +2040,7 @@ test("stop hook does not block when Codex is unavailable even if the review gate
   assert.equal(allowed.status, 0, allowed.stderr);
   assert.equal(allowed.stdout.trim(), "");
   assert.match(allowed.stderr, /Codex is not set up for the review gate/i);
-  assert.match(allowed.stderr, /Run \/codex:setup/i);
+  assert.match(allowed.stderr, /Run \/cx:setup/i);
 });
 
 test("stop hook runs the actual task when auth status looks stale", () => {
@@ -2256,4 +2211,377 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+});
+
+test("runAppServerReview persists and names the thread when asked", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "a.txt"), "x\n");
+
+  const { runAppServerReview, buildRegisteredThreadName } = await import("../plugins/codex/scripts/lib/codex.mjs");
+  const previousPath = process.env.PATH;
+  process.env.PATH = buildEnv(binDir).PATH;
+  try {
+    const result = await runAppServerReview(repo, {
+      target: { type: "uncommittedChanges" },
+      persistThread: true,
+      threadName: buildRegisteredThreadName("review-9")
+    });
+    assert.equal(result.status, 0);
+    const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    const source = fakeState.threads.find((t) => t.id === result.sourceThreadId);
+    const reviewer = fakeState.threads.find((t) => t.id === result.reviewerThreadId);
+    assert.equal(source.ephemeral, false);
+    assert.equal(source.name, "cx:review-9 (request)");
+    assert.equal(reviewer.parentThreadId, result.sourceThreadId);
+    assert.equal(reviewer.name, "cx:review-9");
+  } finally {
+    process.env.PATH = previousPath;
+  }
+});
+
+function seedRepo() {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  return { repo, binDir, env: buildEnv(binDir), statePath: path.join(binDir, "fake-codex-state.json") };
+}
+
+function readRegistry(repo) {
+  return JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "threads.json"), "utf8"));
+}
+
+test("task registers a named persistent thread and prints the thread block", () => {
+  const { repo, env, statePath } = seedRepo();
+  const result = run("node", [SCRIPT, "task", "--name", "auth", "--write", "fix the auth bug"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+  assert.match(result.stdout, /Thread: auth \(thr_1\)\nFollow up: \/cx:ask auth <question>\nResume in Codex: codex resume thr_1/);
+
+  const registry = readRegistry(repo);
+  assert.equal(registry.threads.length, 1);
+  assert.equal(registry.threads[0].name, "auth");
+  assert.equal(registry.threads[0].threadId, "thr_1");
+  assert.equal(registry.threads[0].kind, "task");
+  assert.equal(registry.threads[0].sandbox, "workspace-write");
+  assert.equal(registry.threads[0].turns, 1);
+  assert.equal(registry.threads[0].activeJobId, null);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const thread = fakeState.threads.find((t) => t.id === "thr_1");
+  assert.equal(thread.ephemeral, false);
+  assert.equal(thread.name, "cx:auth");
+});
+
+test("task without --name auto-names the thread", () => {
+  const { repo, env } = seedRepo();
+  run("node", [SCRIPT, "task", "first"], { cwd: repo, env });
+  const result = run("node", [SCRIPT, "task", "second"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(readRegistry(repo).threads.map((t) => t.name), ["task-2", "task-1"]);
+});
+
+test("task --thread resumes the named thread with its own sandbox and model", () => {
+  const { repo, env, statePath } = seedRepo();
+  const start = run("node", [SCRIPT, "task", "--name", "auth", "--model", "gpt-5.4-mini", "look at auth"], { cwd: repo, env });
+  assert.equal(start.status, 0, start.stderr);
+
+  const follow = run("node", [SCRIPT, "task", "--thread", "auth", "follow up on that"], { cwd: repo, env });
+  assert.equal(follow.status, 0, follow.stderr);
+  assert.match(follow.stdout, /Resumed the prior run\./);
+  assert.match(follow.stdout, /Thread: auth \(thr_1\)/);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
+  assert.equal(fakeState.lastTurnStart.model, "gpt-5.4-mini");
+  assert.equal(fakeState.lastResume.sandbox, "read-only");
+  assert.equal(readRegistry(repo).threads[0].turns, 2);
+});
+
+test("task --thread --write widens a read-only thread for that turn", () => {
+  const { repo, env, statePath } = seedRepo();
+  run("node", [SCRIPT, "task", "--name", "auth", "look"], { cwd: repo, env });
+  const follow = run("node", [SCRIPT, "task", "--thread", "auth", "--write", "follow up and fix it"], { cwd: repo, env });
+  assert.equal(follow.status, 0, follow.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastResume.sandbox, "workspace-write");
+});
+
+test("task --thread on an unknown name lists the known names", () => {
+  const { repo, env } = seedRepo();
+  run("node", [SCRIPT, "task", "--name", "auth", "look"], { cwd: repo, env });
+  const result = run("node", [SCRIPT, "task", "--thread", "nope", "hi"], { cwd: repo, env });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /No thread named "nope"\. Known threads: auth\. Run \/cx:threads\./);
+});
+
+test("task flag combinations that conflict are rejected", () => {
+  const { repo, env } = seedRepo();
+  for (const args of [
+    ["--name", "a", "--thread", "b", "x"],
+    ["--thread", "b", "--fresh", "x"],
+    ["--thread", "b", "--resume-last", "x"],
+    ["--name", "a", "--resume-last", "x"],
+    ["--name", "a", "--ephemeral", "x"]
+  ]) {
+    const result = run("node", [SCRIPT, "task", ...args], { cwd: repo, env });
+    assert.equal(result.status, 1, args.join(" "));
+    assert.match(result.stderr, /Choose either|cannot be combined/);
+  }
+});
+
+test("task --ephemeral registers nothing and keeps upstream output", () => {
+  const { repo, env, statePath } = seedRepo();
+  const result = run("node", [SCRIPT, "task", "--ephemeral", "throwaway"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(fs.existsSync(path.join(resolveStateDir(repo), "threads.json")), false);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.threads.find((t) => t.id === "thr_1").ephemeral, true);
+});
+
+test("a failed first run drops its registry entry", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "auth-run-fails");
+  initGitRepo(repo);
+  const result = run("node", [SCRIPT, "task", "--name", "doomed", "x"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(result.status, 1);
+  assert.deepEqual(readRegistry(repo).threads, []);
+});
+
+test("background task --thread goes through the worker and releases the lock", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const start = run("node", [SCRIPT, "task", "--name", "bg", "start"], { cwd: repo, env });
+  assert.equal(start.status, 0, start.stderr);
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "--thread", "bg", "follow up"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const launchPayload = JSON.parse(launched.stdout);
+  assert.equal(launchPayload.status, "queued");
+
+  const busyAttempt = run("node", [SCRIPT, "task", "--thread", "bg", "again"], { cwd: repo, env });
+  assert.equal(busyAttempt.status, 1);
+  assert.match(busyAttempt.stderr, new RegExp(`Thread "bg" is busy with job ${launchPayload.jobId}`));
+
+  const waited = run("node", [SCRIPT, "status", launchPayload.jobId, "--wait", "--timeout-ms", "15000", "--json"], { cwd: repo, env });
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+  assert.equal(JSON.parse(waited.stdout).job.threadName, "bg");
+
+  const registry = await waitFor(() => {
+    const current = readRegistry(repo);
+    return current.threads[0].activeJobId === null ? current : null;
+  });
+  assert.equal(registry.threads[0].turns, 2);
+});
+
+test("cancel releases the thread lock", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interruptible-slow-task");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "--name", "slow", "take a while"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+
+  await waitFor(() => {
+    const status = run("node", [SCRIPT, "status", jobId, "--json"], { cwd: repo, env });
+    const { job } = JSON.parse(status.stdout);
+    return job.status === "running" && job.threadId ? true : null;
+  });
+
+  const cancelled = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.equal(readRegistry(repo).threads[0].activeJobId, null);
+});
+
+function seedDirtyRepo() {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+  return { repo, binDir, env: buildEnv(binDir), statePath: path.join(binDir, "fake-codex-state.json") };
+}
+
+test("review registers the reviewer's own session, not the thread that requested it", () => {
+  const { repo, env, statePath } = seedDirtyRepo();
+  const result = run("node", [SCRIPT, "review", "--name", "pr-review"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /No material issues found/);
+  assert.match(result.stdout, /Thread: pr-review \(thr_2\)\nFollow up: \/cx:ask pr-review <question>/);
+
+  const registry = readRegistry(repo);
+  assert.equal(registry.threads[0].name, "pr-review");
+  assert.equal(registry.threads[0].kind, "review");
+  assert.equal(registry.threads[0].sandbox, "read-only");
+  assert.equal(registry.threads[0].threadId, "thr_2");
+  assert.equal(registry.threads[0].turns, 1);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const source = fakeState.threads.find((t) => t.id === "thr_1");
+  const reviewer = fakeState.threads.find((t) => t.id === "thr_2");
+  assert.equal(source.ephemeral, false);
+  assert.equal(source.name, "cx:pr-review (request)");
+  assert.equal(reviewer.parentThreadId, "thr_1");
+  assert.equal(reviewer.name, "cx:pr-review");
+
+  const follow = run("node", [SCRIPT, "ask", "pr-review", "follow up on what you checked"], { cwd: repo, env });
+  assert.equal(follow.status, 0, follow.stderr);
+  const afterAsk = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(afterAsk.lastTurnStart.threadId, "thr_2");
+});
+
+test("review falls back to the requesting thread when Codex reports no reviewer session", () => {
+  const { repo, binDir, env, statePath } = seedDirtyRepo();
+  installFakeCodex(binDir, "review-no-reviewer-thread");
+  const result = run("node", [SCRIPT, "review", "--name", "pr-review"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Thread: pr-review \(thr_1\)/);
+  assert.equal(readRegistry(repo).threads[0].threadId, "thr_1");
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.threads.find((t) => t.id === "thr_1").name, "cx:pr-review");
+});
+
+test("review auto-names its thread review-N", () => {
+  const { repo, env } = seedDirtyRepo();
+  run("node", [SCRIPT, "review"], { cwd: repo, env });
+  const second = run("node", [SCRIPT, "review"], { cwd: repo, env });
+  assert.equal(second.status, 0, second.stderr);
+  assert.deepEqual(readRegistry(repo).threads.map((t) => t.name), ["review-2", "review-1"]);
+});
+
+test("adversarial review registers an adv-N thread that task --thread can continue", () => {
+  const { repo, env, statePath } = seedDirtyRepo();
+  const review = run("node", [SCRIPT, "adversarial-review", "challenge the design"], { cwd: repo, env });
+  assert.equal(review.status, 0, review.stderr);
+  assert.match(review.stdout, /Thread: adv-1 \(thr_1\)/);
+  assert.equal(readRegistry(repo).threads[0].kind, "adversarial-review");
+
+  const follow = run("node", [SCRIPT, "task", "--thread", "adv-1", "follow up on finding 1"], { cwd: repo, env });
+  assert.equal(follow.status, 0, follow.stderr);
+  assert.match(follow.stdout, /Resumed the prior run/);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
+  assert.equal(fakeState.lastResume.sandbox, "read-only");
+});
+
+test("review --name rejects a duplicate name before contacting Codex", () => {
+  const { repo, env } = seedDirtyRepo();
+  run("node", [SCRIPT, "review", "--name", "dup"], { cwd: repo, env });
+  const again = run("node", [SCRIPT, "review", "--name", "dup"], { cwd: repo, env });
+  assert.equal(again.status, 1);
+  assert.match(again.stderr, /A thread named "dup" already exists/);
+});
+
+test("ask resumes a named thread and is read-only by default", () => {
+  const { repo, env, statePath } = seedDirtyRepo();
+  run("node", [SCRIPT, "review", "--name", "rev"], { cwd: repo, env });
+  const result = run("node", [SCRIPT, "ask", "rev", "elaborate on the follow up"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Resumed the prior run\./);
+  assert.match(result.stdout, /Thread: rev \(thr_2\)/);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastTurnStart.threadId, "thr_2");
+  assert.equal(fakeState.lastTurnStart.prompt, "elaborate on the follow up");
+  assert.equal(fakeState.lastResume.sandbox, "read-only");
+});
+
+test("ask requires a thread and a prompt", () => {
+  const { repo, env } = seedRepo();
+  const noThread = run("node", [SCRIPT, "ask"], { cwd: repo, env });
+  assert.equal(noThread.status, 1);
+  assert.match(noThread.stderr, /Usage: ask <thread> <prompt>/);
+
+  run("node", [SCRIPT, "task", "--name", "t", "x"], { cwd: repo, env });
+  const noPrompt = run("node", [SCRIPT, "ask", "t"], { cwd: repo, env });
+  assert.equal(noPrompt.status, 1);
+  assert.match(noPrompt.stderr, /Provide a question for thread "t"/);
+});
+
+test("ask on an unknown thread fails before anything is queued", () => {
+  const { repo, env } = seedRepo();
+  const result = run("node", [SCRIPT, "ask", "ghost", "--background", "hi"], { cwd: repo, env });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /No thread named "ghost"/);
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
+  assert.deepEqual(JSON.parse(status.stdout).running, []);
+});
+
+test("ask --background queues a job that carries the thread name", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  run("node", [SCRIPT, "task", "--name", "bg", "start"], { cwd: repo, env });
+  const launched = run("node", [SCRIPT, "ask", "bg", "--background", "--json", "follow up"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+  const waited = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "15000", "--json"], { cwd: repo, env });
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+  assert.equal(JSON.parse(waited.stdout).job.threadName, "bg");
+  assert.equal(JSON.parse(waited.stdout).job.title, "Codex Ask bg");
+});
+
+test("threads lists registered threads and forget removes one", () => {
+  const { repo, env } = seedDirtyRepo();
+  const empty = run("node", [SCRIPT, "threads"], { cwd: repo, env });
+  assert.equal(empty.status, 0, empty.stderr);
+  assert.match(empty.stdout, /No Codex threads in this repository\./);
+
+  run("node", [SCRIPT, "review", "--name", "rev"], { cwd: repo, env });
+  run("node", [SCRIPT, "task", "--name", "fix", "--write", "fix it"], { cwd: repo, env });
+
+  const listed = run("node", [SCRIPT, "threads"], { cwd: repo, env });
+  assert.equal(listed.status, 0, listed.stderr);
+  assert.match(listed.stdout, /\| fix \| task \| idle \| 1 \| just now \| fix it \|/);
+  assert.match(listed.stdout, /\| rev \| review \| idle \| 1 \| just now \| Review working tree diff \|/);
+
+  const asJson = run("node", [SCRIPT, "threads", "--json"], { cwd: repo, env });
+  assert.deepEqual(JSON.parse(asJson.stdout).threads.map((t) => t.name), ["fix", "rev"]);
+
+  const forgotten = run("node", [SCRIPT, "forget", "rev"], { cwd: repo, env });
+  assert.equal(forgotten.status, 0, forgotten.stderr);
+  assert.match(forgotten.stdout, /Forgot thread rev\.\nThe Codex conversation itself is untouched\.\nResume in Codex: codex resume thr_2/);
+  assert.deepEqual(readRegistry(repo).threads.map((t) => t.name), ["fix"]);
+
+  const missing = run("node", [SCRIPT, "forget", "rev"], { cwd: repo, env });
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /No thread named "rev"/);
+});
+
+test("the stop-time review gate never registers a thread", () => {
+  const { repo, env } = seedDirtyRepo();
+  const enable = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], { cwd: repo, env });
+  assert.equal(enable.status, 0, enable.stderr);
+
+  const hook = run("node", [STOP_HOOK], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({
+      cwd: repo,
+      session_id: "sess-gate",
+      last_assistant_message: "I changed src/app.js to bump the value."
+    })
+  });
+  assert.equal(hook.status, 0, hook.stderr);
+  assert.equal(JSON.parse(hook.stdout).decision, "block");
+  assert.equal(fs.existsSync(path.join(resolveStateDir(repo), "threads.json")), false);
 });
